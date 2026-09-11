@@ -1,0 +1,19 @@
+[package]
+name = "bt-proximity-lock"
+version = "1.0.0"
+edition = "2021"
+description = "蓝牙远离自动锁屏 - Linux 蓝牙接近锁屏工具"
+license = "MIT"
+
+[[bin]]
+name = "bt-proximity-lock"
+path = "src/main.rs"
+
+[dependencies]
+gtk = { package = "gtk4", version = "0.9", features = ["v4_14"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = { version = "0.4", features = ["alloc"] }
+dirs = "6"
+# D-Bus 静态编译，不需要系统安装 libdbus-1-dev
+libdbus-sys = { version = "0.2", features = ["vendored"] }
