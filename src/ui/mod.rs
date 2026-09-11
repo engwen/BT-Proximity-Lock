@@ -230,6 +230,7 @@ pub struct PickPageWidgets {
     pub container: GtkBox,
     pub device_list: GtkBox,
     pub btn_refresh: Button,
+    pub btn_back: Button,
 }
 
 pub fn build_pick_page() -> PickPageWidgets {
@@ -239,12 +240,23 @@ pub fn build_pick_page() -> PickPageWidgets {
     container.set_margin_top(10);
     container.set_margin_start(15);
     container.set_margin_end(15);
+    container.set_margin_bottom(20);
     container.set_margin_bottom(10);
 
+    // 返回按钮 + 标题
+    let title_box = GtkBox::new(gtk::Orientation::Horizontal, 8);
+    title_box.set_halign(gtk::Align::Fill);
+    title_box.set_hexpand(true);
+    let btn_back = Button::with_label(&tr("btn_back"));
+    btn_back.set_halign(gtk::Align::Start);
+    btn_back.set_margin_start(0);
+    title_box.append(&btn_back);
     let title = gtk::Label::new(Some(&tr("pick_title")));
     title.add_css_class("title-label");
     title.set_halign(gtk::Align::Start);
-    container.append(&title);
+    title.set_hexpand(true);
+    title_box.append(&title);
+    container.append(&title_box);
 
     let hint = gtk::Label::new(Some(&tr("pick_hint")));
     hint.add_css_class("subtitle-label");
@@ -272,6 +284,7 @@ pub fn build_pick_page() -> PickPageWidgets {
         container,
         device_list,
         btn_refresh,
+        btn_back: Button::new(),
     }
 }
 
@@ -354,7 +367,6 @@ pub struct MonitorWidgets {
     pub conn_status: gtk::Label,
     pub rssi_text: gtk::Label,
     pub signal_bar: gtk::ProgressBar,
-    pub status_label: gtk::Label,
     pub btn_toggle: Button,
     pub btn_change: Button,
     // 设置 - 滑块
@@ -371,6 +383,20 @@ pub struct MonitorWidgets {
     pub switch_auto_resume: gtk::Switch,
     pub switch_disconnect_peripherals: gtk::Switch,
     pub switch_auto_start: gtk::Switch,
+    // 设置 - 标签（语言切换时需刷新）
+    pub lbl_settings_title: gtk::Label,
+    pub lbl_lock_delay: gtk::Label,
+    pub lbl_rssi_threshold: gtk::Label,
+    pub lbl_scan_interval: gtk::Label,
+    pub lbl_auto_lock: gtk::Label,
+    pub lbl_auto_unlock: gtk::Label,
+    pub lbl_auto_reconnect: gtk::Label,
+    pub lbl_auto_resume: gtk::Label,
+    pub lbl_disconnect_peripherals: gtk::Label,
+    pub lbl_auto_start: gtk::Label,
+    pub lbl_language: gtk::Label,
+    // 设置 - 语言
+    pub combo_language: gtk::DropDown,
     // 恢复默认
     pub btn_restore_defaults: Button,
     // 诊断
@@ -379,22 +405,21 @@ pub struct MonitorWidgets {
 
 /// 辅助：构建滑块设置行（名称、滑块、默认值同一行）
 fn build_slider_row(
-    title: &str,
+    lbl: &gtk::Label,
     min: f64,
     max: f64,
     initial: f64,
     unit: &str,
     slider_ref: &gtk::Scale,
-    label_ref: &gtk::Label,
+    value_ref: &gtk::Label,
 ) -> GtkBox {
     let row = GtkBox::new(gtk::Orientation::Horizontal, 8);
     row.add_css_class("settings-row");
     row.set_valign(gtk::Align::Center);
 
-    let lbl = gtk::Label::new(Some(title));
     lbl.add_css_class("settings-row-label");
     lbl.set_halign(gtk::Align::Start);
-    row.append(&lbl);
+    row.append(lbl);
 
     slider_ref.set_range(min, max);
     slider_ref.set_hexpand(true);
@@ -404,13 +429,13 @@ fn build_slider_row(
     slider_ref.set_has_origin(false);
     row.append(slider_ref);
 
-    label_ref.add_css_class("settings-row-value");
-    label_ref.set_halign(gtk::Align::End);
-    label_ref.set_width_chars(5);
-    label_ref.set_text(&format!("{initial:.0}{unit}"));
-    row.append(label_ref);
+    value_ref.add_css_class("settings-row-value");
+    value_ref.set_halign(gtk::Align::End);
+    value_ref.set_width_chars(5);
+    value_ref.set_text(&format!("{initial:.0}{unit}"));
+    row.append(value_ref);
 
-    let label_clone = label_ref.clone();
+    let label_clone = value_ref.clone();
     let unit_s = unit.to_string();
     slider_ref.connect_value_changed(move |s| {
         let v = s.value() as i32;
@@ -420,16 +445,17 @@ fn build_slider_row(
 }
 
 /// 辅助：构建开关设置行
-fn build_switch_row(title: &str, initial: bool, switch_ref: &gtk::Switch) -> GtkBox {
+fn build_switch_row(lbl: &gtk::Label, initial: bool, switch_ref: &gtk::Switch) -> GtkBox {
     let row = GtkBox::new(gtk::Orientation::Horizontal, 8);
     row.add_css_class("settings-row");
     row.set_valign(gtk::Align::Center);
-    let label = gtk::Label::new(Some(title));
-    label.add_css_class("settings-row-label");
-    label.set_halign(gtk::Align::Start);
-    label.set_hexpand(true);
-    label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    row.append(&label);
+    lbl.add_css_class("settings-row-label");
+    lbl.set_halign(gtk::Align::Start);
+    lbl.set_xalign(0.0);
+    lbl.set_size_request(160, -1);
+    lbl.set_hexpand(true);
+    lbl.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    row.append(lbl);
     switch_ref.set_active(initial);
     switch_ref.set_halign(gtk::Align::End);
     row.append(switch_ref);
@@ -450,11 +476,11 @@ fn build_settings_card(mw: &MonitorWidgets) -> GtkBox {
     let collapse_label = gtk::Label::new(Some("▾"));
     collapse_label.set_margin_end(6);
     header.append(&collapse_label);
-    let title = gtk::Label::new(Some(&tr("label_settings")));
-    title.add_css_class("card-title");
-    title.set_halign(gtk::Align::Start);
-    title.set_hexpand(true);
-    header.append(&title);
+    mw.lbl_settings_title.set_text(&tr("label_settings"));
+    mw.lbl_settings_title.add_css_class("card-title");
+    mw.lbl_settings_title.set_halign(gtk::Align::Start);
+    mw.lbl_settings_title.set_hexpand(true);
+    header.append(&mw.lbl_settings_title);
     card.append(&header);
 
     // 可折叠内容区
@@ -465,25 +491,42 @@ fn build_settings_card(mw: &MonitorWidgets) -> GtkBox {
 
     // ── 滑块设置 ──
     content.append(&build_slider_row(
-        &tr("settings_lock_delay"), 1.0, 60.0, 9.0, "s",
+        &mw.lbl_lock_delay, 1.0, 60.0, 9.0, "s",
         &mw.slider_lock_delay, &mw.label_lock_delay_value,
     ));
     content.append(&build_slider_row(
-        &tr("settings_rssi_threshold"), -90.0, -20.0, -50.0, "dBm",
+        &mw.lbl_rssi_threshold, -90.0, -20.0, -50.0, "dBm",
         &mw.slider_rssi_threshold, &mw.label_rssi_threshold_value,
     ));
     content.append(&build_slider_row(
-        &tr("settings_scan_interval"), 1.0, 30.0, 3.0, "s",
+        &mw.lbl_scan_interval, 1.0, 30.0, 3.0, "s",
         &mw.slider_scan_interval, &mw.label_scan_interval_value,
     ));
 
     // ── 开关设置 ──
-    content.append(&build_switch_row(&tr("settings_auto_lock"), true, &mw.switch_auto_lock));
-    content.append(&build_switch_row(&tr("settings_auto_unlock"), false, &mw.switch_auto_unlock));
-    content.append(&build_switch_row(&tr("settings_auto_reconnect"), true, &mw.switch_auto_connect));
-    content.append(&build_switch_row(&tr("settings_auto_resume"), true, &mw.switch_auto_resume));
-    content.append(&build_switch_row(&tr("settings_disconnect_peripherals"), false, &mw.switch_disconnect_peripherals));
-    content.append(&build_switch_row(&tr("settings_auto_start"), false, &mw.switch_auto_start));
+    content.append(&build_switch_row(&mw.lbl_auto_lock, true, &mw.switch_auto_lock));
+    content.append(&build_switch_row(&mw.lbl_auto_unlock, false, &mw.switch_auto_unlock));
+    content.append(&build_switch_row(&mw.lbl_auto_reconnect, true, &mw.switch_auto_connect));
+    content.append(&build_switch_row(&mw.lbl_auto_resume, true, &mw.switch_auto_resume));
+    content.append(&build_switch_row(&mw.lbl_disconnect_peripherals, false, &mw.switch_disconnect_peripherals));
+    content.append(&build_switch_row(&mw.lbl_auto_start, false, &mw.switch_auto_start));
+
+    // ── 语言选择 ──
+    {
+        let row = GtkBox::new(gtk::Orientation::Horizontal, 8);
+        row.add_css_class("settings-row");
+        row.set_valign(gtk::Align::Center);
+        mw.lbl_language.set_text(&tr("settings_language"));
+        mw.lbl_language.add_css_class("settings-row-label");
+        mw.lbl_language.set_halign(gtk::Align::Start);
+        mw.lbl_language.set_xalign(0.0);
+        mw.lbl_language.set_size_request(160, -1);
+        mw.lbl_language.set_hexpand(true);
+        row.append(&mw.lbl_language);
+        mw.combo_language.set_halign(gtk::Align::End);
+        row.append(&mw.combo_language);
+        content.append(&row);
+    }
 
     {
         let btn_box = GtkBox::new(gtk::Orientation::Horizontal, 8);
@@ -517,10 +560,10 @@ pub fn build_monitor_page(
 ) -> MonitorWidgets {
     let container = GtkBox::new(gtk::Orientation::Vertical, 0);
     container.set_hexpand(true);
-    container.set_vexpand(true);
     container.set_margin_top(5);
     container.set_margin_start(15);
     container.set_margin_end(15);
+    container.set_margin_bottom(32);
 
     // ── 设备信息卡片 ──
     let device_card = GtkBox::new(gtk::Orientation::Vertical, 0);
@@ -604,14 +647,6 @@ pub fn build_monitor_page(
     });
     btn_box.append(&btn_change);
 
-    // ── 状态栏 ──
-    let status_bar = GtkBox::new(gtk::Orientation::Horizontal, 0);
-    status_bar.add_css_class("status-bar");
-    status_bar.set_margin_top(8);
-    let status_label = gtk::Label::new(Some(&tr("status_ready")));
-    status_label.set_halign(gtk::Align::Start);
-    status_bar.append(&status_label);
-
     // ── 先创建 MonitorWidgets（设置控件需要引用）──
     let mw = MonitorWidgets {
         container: container.clone(),
@@ -621,7 +656,6 @@ pub fn build_monitor_page(
         conn_status: conn_status.clone(),
         rssi_text: rssi_text.clone(),
         signal_bar: signal_bar.clone(),
-        status_label: status_label.clone(),
         btn_toggle: btn_toggle.clone(),
         btn_change: btn_change.clone(),
         // 滑块
@@ -638,6 +672,23 @@ pub fn build_monitor_page(
         switch_auto_resume: gtk::Switch::new(),
         switch_disconnect_peripherals: gtk::Switch::new(),
         switch_auto_start: gtk::Switch::new(),
+        // 设置标签（语言切换时需刷新）
+        lbl_settings_title: gtk::Label::new(Some(&tr("label_settings"))),
+        lbl_lock_delay: gtk::Label::new(Some(&tr("settings_lock_delay"))),
+        lbl_rssi_threshold: gtk::Label::new(Some(&tr("settings_rssi_threshold"))),
+        lbl_scan_interval: gtk::Label::new(Some(&tr("settings_scan_interval"))),
+        lbl_auto_lock: gtk::Label::new(Some(&tr("settings_auto_lock"))),
+        lbl_auto_unlock: gtk::Label::new(Some(&tr("settings_auto_unlock"))),
+        lbl_auto_reconnect: gtk::Label::new(Some(&tr("settings_auto_reconnect"))),
+        lbl_auto_resume: gtk::Label::new(Some(&tr("settings_auto_resume"))),
+        lbl_disconnect_peripherals: gtk::Label::new(Some(&tr("settings_disconnect_peripherals"))),
+        lbl_auto_start: gtk::Label::new(Some(&tr("settings_auto_start"))),
+        lbl_language: gtk::Label::new(Some(&tr("settings_language"))),
+        // 语言下拉框
+        combo_language: {
+            let model = gtk::StringList::new(&["中文", "English"]);
+            gtk::DropDown::new(Some(model.clone()), None::<gtk::Expression>)
+        },
         // 按钮
         btn_restore_defaults: Button::with_label(&tr("btn_restore_defaults")),
         btn_log: Button::with_label(&tr("btn_test")),
@@ -647,7 +698,6 @@ pub fn build_monitor_page(
     let settings_card = build_settings_card(&mw);
     container.append(&settings_card);
     container.append(&btn_box);
-    container.append(&status_bar);
 
     mw
 }
@@ -669,6 +719,27 @@ pub fn sync_settings_from_config(mw: &MonitorWidgets, cfg: &Config) {
     mw.switch_auto_resume.set_active(cfg.auto_resume_on_reconnect);
     mw.switch_disconnect_peripherals.set_active(cfg.disconnect_peripherals);
     mw.switch_auto_start.set_active(cfg.auto_start_on_boot);
+    // 语言下拉框
+    let lang_idx = match cfg.language.as_str() {
+        "en-US" => 1,
+        _ => 0,
+    };
+    mw.combo_language.set_selected(lang_idx);
+}
+
+/// 刷新所有设置标签文本（语言切换时调用）
+pub fn refresh_labels(mw: &MonitorWidgets) {
+    mw.lbl_settings_title.set_text(&tr("label_settings"));
+    mw.lbl_lock_delay.set_text(&tr("settings_lock_delay"));
+    mw.lbl_rssi_threshold.set_text(&tr("settings_rssi_threshold"));
+    mw.lbl_scan_interval.set_text(&tr("settings_scan_interval"));
+    mw.lbl_auto_lock.set_text(&tr("settings_auto_lock"));
+    mw.lbl_auto_unlock.set_text(&tr("settings_auto_unlock"));
+    mw.lbl_auto_reconnect.set_text(&tr("settings_auto_reconnect"));
+    mw.lbl_auto_resume.set_text(&tr("settings_auto_resume"));
+    mw.lbl_disconnect_peripherals.set_text(&tr("settings_disconnect_peripherals"));
+    mw.lbl_auto_start.set_text(&tr("settings_auto_start"));
+    mw.lbl_language.set_text(&tr("settings_language"));
 }
 
 /// 从 UI 控件读取设置值（返回临时 Config 值，需要外部应用）

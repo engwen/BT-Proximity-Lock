@@ -1,0 +1,10 @@
+Package: bt-proximity-lock
+Version: 1.0.0
+Section: utils
+Priority: optional
+Architecture: amd64
+Maintainer: BT Proximity Lock Maintainer <maintainer@localhost>
+Depends: libgtk-4-1, bluez, dbus, systemd
+Description: Bluetooth proximity automatic screen locker
+ Monitors a configured Bluetooth device and locks the screen when it moves away.
+ Supports GTK4 desktops and multiple Linux screen-locking backends.

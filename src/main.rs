@@ -19,7 +19,7 @@ use gtk::{self, glib, Application, ApplicationWindow, Box as GtkBox};
 
 use bluetooth_monitor::{BluetoothMonitor, BtEvent};
 use config::Config;
-use i18n::{detect_language, set_lang, tr, tr_fmt};
+use i18n::{detect_language, set_lang, tr};
 use poller::SmartPoller;
 use tray::TrayIcon;
 
@@ -63,9 +63,13 @@ struct AppCore {
     countdown_started: bool,
     countdown_expired: bool,
     countdown_remaining: i32,
+    // 平滑采样：事件驱动路径中连续低于阈值的次数
+    low_rssi_consecutive: i32,
     // 重连
     retry_pending: bool,
     retry_round_count: i32,
+    // 轮询倒计时（秒），控制动态轮询间隔
+    poll_countdown: i32,
     // 事件通道
     event_tx: Option<mpsc::Sender<BtEvent>>,
     event_rx: Option<mpsc::Receiver<BtEvent>>,
@@ -92,8 +96,10 @@ fn new_core(config: Config) -> SharedCore {
         countdown_started: false,
         countdown_expired: false,
         countdown_remaining: 0,
+        low_rssi_consecutive: 0,
         retry_pending: false,
         retry_round_count: 0,
+        poll_countdown: 0,
         event_tx: Some(tx),
         event_rx: Some(rx),
     }))
@@ -124,6 +130,7 @@ impl AppCore {
         self.countdown_remaining = 0;
         self.countdown_started = false;
         self.countdown_expired = false;
+        self.low_rssi_consecutive = 0;
         if self.app_state == AppState::Countdown {
             self.set_state(AppState::Monitoring);
         }
@@ -137,6 +144,11 @@ impl AppCore {
             return;
         }
         if self.countdown_started {
+            return;
+        }
+        if !self.ever_connected {
+            log::debug!("设备从未连接过，跳过锁屏倒计时");
+            self.set_state(AppState::Monitoring);
             return;
         }
         if !self.config.auto_lock_enabled {
@@ -181,6 +193,32 @@ impl AppCore {
         self.auto_connecting = true;
         self.auto_connect_attempts = 0;
         self.set_conn("reconnecting", -100);
+    }
+
+    /// 断开所有已连接的蓝牙外设（非手机），需要时在锁屏前调用
+    fn disconnect_bluetooth_peripherals(&self) {
+        if !self.config.disconnect_peripherals {
+            return;
+        }
+        // 使用 bluetoothctl 获取已连接设备列表，断开除手机外的设备
+        let output = std::process::Command::new("bluetoothctl")
+            .args(["devices", "Connected"])
+            .output();
+        if let Ok(out) = output {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let phone_mac = self.config.phone_mac.to_uppercase().replace('-', ":");
+            for line in stdout.lines() {
+                // 格式: "Device XX:XX:XX:XX:XX:XX DeviceName"
+                if let Some(mac) = line.strip_prefix("Device ").and_then(|s| s.split_whitespace().next()) {
+                    if mac.to_uppercase() != phone_mac {
+                        log::info!("断开蓝牙外设: {mac}");
+                        let _ = std::process::Command::new("bluetoothctl")
+                            .args(["disconnect", mac])
+                            .output();
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -231,6 +269,7 @@ fn main() {
     );
     if cfg.language.is_empty() {
         cfg.language = detect_language();
+        cfg.save();
     }
     set_lang(&cfg.language);
 
@@ -261,15 +300,10 @@ fn main() {
                 let c = core.lock().unwrap();
                 c.config.window_width
             })
-            .default_height({
-                let c = core.lock().unwrap();
-                c.config.window_height
-            })
             .build();
 
         // ── 构建 UI ──
         let main_box = GtkBox::new(gtk::Orientation::Vertical, 0);
-        main_box.set_vexpand(true);
         main_box.set_hexpand(true);
         // 顶栏
         let header = GtkBox::new(gtk::Orientation::Vertical, 0);
@@ -292,14 +326,13 @@ fn main() {
         pick_widgets.container.set_vexpand(true);
         let page_container = GtkBox::new(gtk::Orientation::Vertical, 0);
         page_container.set_hexpand(true);
-        page_container.set_vexpand(true);
         page_container.set_visible(false);
 
         // ── 监控页（带回调）──
         // 使用 RefCell 延迟引用 mw（因为 mw 在 build_monitor_page 之后才创建）
         let mw_holder: Rc<RefCell<Option<Arc<Mutex<ui::MonitorWidgets>>>>> =
             Rc::new(RefCell::new(None));
-        let mw_holder2 = mw_holder.clone();
+        let mw_holder2: Rc<RefCell<Option<Arc<Mutex<ui::MonitorWidgets>>>>> = mw_holder.clone();
         let mw: Arc<Mutex<ui::MonitorWidgets>> = Arc::new(Mutex::new(ui::build_monitor_page(
             {
                 let c = core.clone();
@@ -346,6 +379,15 @@ fn main() {
                 refresh_device_list_ui(&dl, &win, &c, &pc, &pk);
             });
         }
+        // 返回按钮：返回监控页（不更改配置）
+        {
+            let pc = page_container.clone();
+            let pk = pick_widgets.container.clone();
+            pick_widgets.btn_back.connect_clicked(move |_| {
+                pk.set_visible(false);
+                pc.set_visible(true);
+            });
+        }
 
         let mw_unlocked = mw.lock().unwrap();
         page_container.append(&mw_unlocked.container);
@@ -382,6 +424,45 @@ fn main() {
                 let cfg = core.lock().unwrap().config.clone();
                 ui::sync_settings_from_config(&mw_unlocked, &cfg);
                 drop(mw_unlocked);
+                let auto_start = cfg.auto_connect_device;
+                drop(cfg);
+                if auto_start {
+                    start_monitoring(&core);
+                    let should_connect = {
+                        let mut c = core.lock().unwrap();
+                        let connected = c
+                            .bt_monitor
+                            .as_mut()
+                            .map(|bt| {
+                                let connected_now = bt.check_connected_now();
+                                bt.connected = connected_now;
+                                connected_now
+                            })
+                            .unwrap_or(false);
+                        let rssi = c
+                            .bt_monitor
+                            .as_ref()
+                            .map(|bt| bt.current_rssi)
+                            .unwrap_or(-100);
+
+                        if connected {
+                            c.ever_connected = true;
+                            c.set_state(AppState::Monitoring);
+                            c.set_conn("connected", rssi);
+                            false
+                        } else {
+                            c.set_state(AppState::Monitoring);
+                            c.start_auto_connect();
+                            true
+                        }
+                    };
+                    let c = core.lock().unwrap();
+                    update_ui(&c, &mw);
+                    drop(c);
+                    if should_connect {
+                        start_connect_attempt(&core);
+                    }
+                }
             }
         }
 
@@ -480,6 +561,26 @@ fn main() {
                     }
                 });
             }
+            // 语言下拉框
+            {
+                let c2 = c.clone();
+                let mw_ref = mw2.clone();
+                let combo = { mw2.lock().unwrap().combo_language.clone() };
+                combo.connect_selected_notify(move |ddl| {
+                    let lang = match ddl.selected() {
+                        1 => "en-US",
+                        _ => "zh-CN",
+                    };
+                    c2.lock().unwrap().config.language = lang.to_string();
+                    c2.lock().unwrap().config.save();
+                    crate::i18n::set_lang(lang);
+                    // 刷新所有设置标签
+                    let mw_ui = mw_ref.lock().unwrap();
+                    ui::refresh_labels(&mw_ui);
+                    drop(mw_ui);
+                    log::info!("语言已切换: {lang}");
+                });
+            }
             // 恢复默认按钮
             {
                 let c2 = c.clone();
@@ -498,6 +599,7 @@ fn main() {
                         c.config.auto_resume_on_reconnect = default_cfg.auto_resume_on_reconnect;
                         c.config.disconnect_peripherals = default_cfg.disconnect_peripherals;
                         c.config.auto_start_on_boot = default_cfg.auto_start_on_boot;
+                        c.config.language = default_cfg.language;
                         c.config.save();
                     }
                     // 禁用自启
@@ -521,11 +623,21 @@ fn main() {
         }
 
         // ── 定时器 ──
-        // 蓝牙轮询（每3秒）
+        // 蓝牙轮询（1秒基础间隔 + 动态倒计时）
         {
             let c = core.clone();
             let mw2 = mw.clone();
-            glib::timeout_add_seconds_local(3, move || {
+            glib::timeout_add_seconds_local(1, move || {
+                {
+                    let mut c = c.lock().unwrap();
+                    if matches!(c.app_state, AppState::Idle | AppState::Locking) {
+                        return glib::ControlFlow::Continue;
+                    }
+                    if c.poll_countdown > 0 {
+                        c.poll_countdown -= 1;
+                        return glib::ControlFlow::Continue;
+                    }
+                }
                 bt_poll_tick(&c, &mw2);
                 glib::ControlFlow::Continue
             });
@@ -587,11 +699,19 @@ fn start_monitoring(core: &SharedCore) {
     } else {
         log::warn!("蓝牙监控初始化失败，等待适配器就绪");
     }
+    let connected = bt.connected;
+    let rssi = bt.current_rssi;
     c.bt_monitor = Some(bt);
     let mut poller = SmartPoller::new(c.config.rssi_threshold, c.config.scan_interval_sec);
     poller.start();
     c.poller = Some(poller);
     c.set_state(AppState::Monitoring);
+    if connected {
+        c.ever_connected = true;
+        c.set_conn("connected", rssi);
+    } else {
+        c.set_conn("disconnected", -100);
+    }
 }
 
 fn stop_monitoring(core: &SharedCore) {
@@ -720,6 +840,7 @@ fn handle_bt_event(core: &SharedCore, event: BtEvent, mw: &Arc<Mutex<ui::Monitor
     match event {
         BtEvent::Connected => {
             c.ever_connected = true;
+            c.low_rssi_consecutive = 0;
             if c.app_state == AppState::Monitoring {
                 return;
             }
@@ -789,14 +910,25 @@ fn handle_bt_event(core: &SharedCore, event: BtEvent, mw: &Arc<Mutex<ui::Monitor
                         "信号恢复: {rssi}dBm >= 阈值{}dBm，取消锁屏",
                         c.config.rssi_threshold
                     );
+                    c.low_rssi_consecutive = 0;
                     c.cancel_countdown();
                     c.set_state(AppState::Monitoring);
                 }
                 return;
             }
             if rssi < c.config.rssi_threshold {
-                log::warn!("信号低于阈值: {rssi}dBm < {}dBm", c.config.rssi_threshold);
-                c.start_countdown();
+                c.low_rssi_consecutive += 1;
+                log::info!(
+                    "信号低于阈值: {rssi}dBm < {}dBm ({}/3)",
+                    c.config.rssi_threshold,
+                    c.low_rssi_consecutive
+                );
+                if c.low_rssi_consecutive >= 3 {
+                    c.low_rssi_consecutive = 0;
+                    c.start_countdown();
+                }
+            } else {
+                c.low_rssi_consecutive = 0;
             }
         }
         BtEvent::AdapterPoweredOff => {
@@ -848,7 +980,8 @@ fn bt_poll_tick(core: &SharedCore, mw: &Arc<Mutex<ui::MonitorWidgets>>) {
             crate::log_capture::push_rssi(rssi);
         }
         if let Some(poller) = &mut c.poller {
-            let (_next_ms, trigger_disconnect) = poller.tick(connected, rssi, rssi_supported);
+            let (next_ms, trigger_disconnect) = poller.tick(connected, rssi, rssi_supported);
+            c.poll_countdown = (next_ms / 1000).max(1) as i32;
             if trigger_disconnect {
                 drop(c);
                 handle_bt_event(core, BtEvent::Disconnected, mw);
@@ -870,7 +1003,7 @@ fn bt_poll_tick(core: &SharedCore, mw: &Arc<Mutex<ui::MonitorWidgets>>) {
 
 // ── 倒计时 ────────────────────────────────────────────────────────────────
 
-fn countdown_tick(core: &SharedCore, mw: &Arc<Mutex<ui::MonitorWidgets>>) {
+fn countdown_tick(core: &SharedCore, _mw: &Arc<Mutex<ui::MonitorWidgets>>) {
     let mut c = core.lock().unwrap();
     if c.app_state != AppState::Countdown || c.countdown_remaining <= 0 {
         return;
@@ -883,20 +1016,14 @@ fn countdown_tick(core: &SharedCore, mw: &Arc<Mutex<ui::MonitorWidgets>>) {
         return;
     }
     c.countdown_remaining -= 1;
-    if c.countdown_remaining > 0 {
-        let mw = mw.lock().unwrap();
-        mw.status_label.set_text(&tr_fmt(
-            "status_countdown",
-            &[("n", &c.countdown_remaining.to_string())],
-        ));
-    } else {
+    if c.countdown_remaining <= 0 {
         c.countdown_expired = true;
         drop(c);
-        do_lock_screen(core, mw);
+        do_lock_screen(core);
     }
 }
 
-fn do_lock_screen(core: &SharedCore, mw: &Arc<Mutex<ui::MonitorWidgets>>) {
+fn do_lock_screen(core: &SharedCore) {
     let mut c = core.lock().unwrap();
     if matches!(c.app_state, AppState::Locking | AppState::AutoPaused) {
         return;
@@ -910,26 +1037,19 @@ fn do_lock_screen(core: &SharedCore, mw: &Arc<Mutex<ui::MonitorWidgets>>) {
         return;
     }
     log::info!("执行锁屏");
+    c.disconnect_bluetooth_peripherals();
     c.set_state(AppState::Locking);
     c.countdown_started = false;
-    let mw_ui = mw.lock().unwrap();
-    mw_ui.status_label.set_text(&tr("status_locking"));
     let locked = locker::lock_screen();
     if locked {
-        let mw_ui = mw.lock().unwrap();
-        mw_ui.status_label.set_text(&tr("status_locked"));
         if c.config.auto_resume_on_reconnect {
             c.set_state(AppState::AutoPaused);
-            let mw_ui = mw.lock().unwrap();
-            mw_ui.status_label.set_text(&tr("status_paused_waiting"));
         } else {
             drop(c);
             stop_monitoring(core);
             return;
         }
     } else {
-        let mw_ui = mw.lock().unwrap();
-        mw_ui.status_label.set_text(&tr("status_lock_failed"));
         c.set_state(AppState::Monitoring);
     }
 }
@@ -1023,6 +1143,7 @@ fn on_reconnect_success(core: &SharedCore) {
     let mut c = core.lock().unwrap();
     log::info!("重连成功: 状态={:?}", c.app_state);
     c.ever_connected = true;
+    c.low_rssi_consecutive = 0;
     c.lock_abandoned = false;
     c.retry_round_count = 0;
     c.retry_pending = false;
@@ -1167,23 +1288,4 @@ fn update_ui(c: &AppCore, mw: &Arc<Mutex<ui::MonitorWidgets>>) {
         _ => "active",
     };
     ui::update_toggle_button(&mw.btn_toggle, state_str);
-
-    // 更新状态栏文本
-    let status_text = match c.app_state {
-        AppState::Idle => i18n::tr("status_monitoring_off"),
-        AppState::Monitoring => {
-            if c.ever_connected {
-                i18n::tr("status_monitoring_on")
-            } else {
-                i18n::tr("status_scanning")
-            }
-        }
-        AppState::Countdown => {
-            i18n::tr_fmt("status_countdown", &[("n", &c.countdown_remaining.to_string())])
-        }
-        AppState::Locking => i18n::tr("status_locking"),
-        AppState::AutoPaused => i18n::tr("status_paused_waiting"),
-        AppState::BleTurnedOff => i18n::tr("status_ble_turned_off"),
-    };
-    mw.status_label.set_text(&status_text);
 }

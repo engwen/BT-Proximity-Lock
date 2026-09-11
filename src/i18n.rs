@@ -15,6 +15,7 @@ fn zh_cn_strings() -> HashMap<&'static str, &'static str> {
         "未发现已连接的蓝牙设备\n\n请先确保手机蓝牙已开启并连接到此电脑\n然后点击「刷新设备列表」",
     );
     m.insert("btn_refresh", "刷新设备列表");
+    m.insert("btn_back", "返回");
     m.insert("btn_start", "开始监控");
     m.insert("btn_stop", "停止监控");
     m.insert("btn_resume", "恢复监控");
@@ -100,6 +101,7 @@ fn en_us_strings() -> HashMap<&'static str, &'static str> {
     );
     m.insert("pick_no_devices", "No connected Bluetooth devices found\n\nPlease make sure your phone Bluetooth is on\nand connected to this computer,\nthen click \"Refresh Device List\"");
     m.insert("btn_refresh", "Refresh Devices");
+    m.insert("btn_back", "Back");
     m.insert("btn_start", "Start Monitor");
     m.insert("btn_stop", "Stop Monitor");
     m.insert("btn_resume", "Resume Monitor");

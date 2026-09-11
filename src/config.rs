@@ -91,7 +91,7 @@ fn default_auto_resume() -> bool {
     DEFAULT_AUTO_RESUME
 }
 fn default_language() -> String {
-    "zh-CN".into()
+    String::new()
 }
 fn default_window_width() -> i32 {
     DEFAULT_WINDOW_WIDTH
@@ -116,7 +116,7 @@ impl Default for Config {
             auto_resume_on_reconnect: DEFAULT_AUTO_RESUME,
             auto_unlock_on_reconnect: DEFAULT_AUTO_UNLOCK,
             auto_start_on_boot: DEFAULT_AUTO_START,
-            language: "zh-CN".into(),
+            language: String::new(),
             window_width: DEFAULT_WINDOW_WIDTH,
             window_height: DEFAULT_WINDOW_HEIGHT,
         }

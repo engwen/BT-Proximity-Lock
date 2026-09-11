@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=BT Proximity Lock
+Name[zh_CN]=蓝牙接近锁屏
+Comment=Lock the screen when your Bluetooth device moves away
+Comment[zh_CN]=蓝牙设备远离时自动锁屏
+Exec=bt-proximity-lock
+Icon=preferences-system-privacy
+Terminal=false
+Type=Application
+Categories=Utility;Security;
+StartupNotify=true
