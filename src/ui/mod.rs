@@ -284,7 +284,7 @@ pub fn build_pick_page() -> PickPageWidgets {
         container,
         device_list,
         btn_refresh,
-        btn_back: Button::new(),
+        btn_back,
     }
 }
 
@@ -330,12 +330,12 @@ pub fn create_device_card(
     name_label.set_hexpand(true);
     row1.append(&name_label);
 
-    let status_text = if device.connected {
-        "● 已连接"
+    let status_label = gtk::Label::new(None);
+    if device.connected {
+        status_label.set_markup("<span foreground=\"#2ecc71\">● 已连接</span>");
     } else {
-        "○ 未连接"
-    };
-    let status_label = gtk::Label::new(Some(status_text));
+        status_label.set_markup("<span foreground=\"#888888\">○ 未连接</span>");
+    }
     status_label.set_halign(gtk::Align::End);
     row1.append(&status_label);
     card.append(&row1);

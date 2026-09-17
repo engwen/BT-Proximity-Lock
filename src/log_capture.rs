@@ -13,7 +13,7 @@ static RSSI_HISTORY: Mutex<VecDeque<i32>> = Mutex::new(VecDeque::new());
 pub fn init() -> Result<(), SetLoggerError> {
     *LOG_BUFFER.lock().unwrap() = Some(VecDeque::with_capacity(256));
     log::set_boxed_logger(Box::new(CaptureLogger))
-        .map(|()| log::set_max_level(LevelFilter::Info))
+        .map(|()| log::set_max_level(LevelFilter::Debug))
 }
 
 /// 记录一个 RSSI 数据点

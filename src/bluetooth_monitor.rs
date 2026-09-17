@@ -31,8 +31,10 @@ pub struct BluetoothMonitor {
     pub rssi_supported: bool,
     rssi_samples: VecDeque<i32>,
     // 连接状态去抖动
-    conn_confirm_count: i32,
-    pending_conn: Option<bool>,
+        conn_confirm_count: i32,
+        pending_conn: Option<bool>,
+        /// 稳定连接状态，确认后更新，用于 RSSI 查询
+        stable_connected: bool,
     // 事件通道
     event_tx: Option<mpsc::Sender<BtEvent>>,
 }
@@ -56,6 +58,7 @@ impl BluetoothMonitor {
             rssi_samples: VecDeque::with_capacity(8),
             conn_confirm_count: 0,
             pending_conn: None,
+            stable_connected: false,
             event_tx: None,
         }
     }
@@ -107,6 +110,7 @@ impl BluetoothMonitor {
         }
         let props = self.get_device_props();
         self.connected = props.connected.unwrap_or(false);
+        self.stable_connected = self.connected;
         self.update_rssi(props.rssi.unwrap_or(-100));
         log::info!(
             "蓝牙监控就绪 - 设备: {} 连接: {} RSSI: {}",
@@ -157,7 +161,6 @@ impl BluetoothMonitor {
         }
         let props = self.get_device_props();
         let new_connected = props.connected.unwrap_or(false);
-        let new_rssi = props.rssi.unwrap_or(-100);
         // 去抖动处理
         if new_connected == self.connected {
             self.pending_conn = None;
@@ -183,10 +186,22 @@ impl BluetoothMonitor {
                 }
             }
         }
-        self.update_rssi(new_rssi);
-        // 只在RSSI值实际变化时发送事件，避免过于频繁的事件
-        if new_rssi != self.current_rssi {
-            self.send_event(BtEvent::RssiChanged(new_rssi));
+        // RSSI 只在设备已连接时读取，避免断开后读到虚假值
+        if self.connected {
+            let old_rssi = self.current_rssi;
+            self.update_rssi(props.rssi.unwrap_or(-100));
+            if self.current_rssi != old_rssi {
+                self.send_event(BtEvent::RssiChanged(self.current_rssi));
+            }
+            self.stable_connected = true;
+        } else {
+            // 断开状态稳定后重置 RSSI
+            if self.stable_connected {
+                self.current_rssi = -100;
+                self.filtered_rssi = -100;
+                self.rssi_samples.clear();
+                self.stable_connected = false;
+            }
         }
     }
 

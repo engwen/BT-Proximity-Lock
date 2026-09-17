@@ -3,24 +3,26 @@
 use std::process::Command;
 
 /// 获取系统空闲时间（毫秒），自动探测桌面环境
-pub fn get_idle_ms() -> u64 {
+/// 返回 None 表示无法检测（应视为用户未活动，允许锁屏）
+/// 返回 Some(0) 表示用户刚刚有过操作（鼠标/键盘）
+pub fn get_idle_ms() -> Option<u64> {
     // 方式1: GNOME Mutter IdleMonitor D-Bus（Wayland + GNOME）
     if let Some(ms) = try_idle_mutter() {
-        return ms;
+        return Some(ms);
     }
     // 方式2: xprintidle（X11，需安装）
     if let Some(ms) = try_idle_xprintidle() {
-        return ms;
+        return Some(ms);
     }
     // 方式3: xssstate（X11 轻量工具）
     if let Some(ms) = try_idle_xssstate() {
-        return ms;
+        return Some(ms);
     }
     // 方式4: D-Bus org.freedesktop.ScreenSaver（通用）
     if let Some(ms) = try_idle_dbus_screensaver() {
-        return ms;
+        return Some(ms);
     }
-    0
+    None
 }
 
 fn try_idle_mutter() -> Option<u64> {

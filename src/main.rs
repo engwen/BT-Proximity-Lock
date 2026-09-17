@@ -13,6 +13,8 @@ mod ui;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 use gtk::prelude::*;
 use gtk::{self, glib, Application, ApplicationWindow, Box as GtkBox};
@@ -21,7 +23,40 @@ use bluetooth_monitor::{BluetoothMonitor, BtEvent};
 use config::Config;
 use i18n::{detect_language, set_lang, tr};
 use poller::SmartPoller;
-use tray::TrayIcon;
+use tray::{TrayIcon, TrayState};
+
+// ── 轮询线程消息类型 ────────────────────────────────────────────────────
+
+/// 轮询线程 → 主线程 的消息
+#[derive(Debug, Clone)]
+enum PollMsg {
+    /// 轮询状态更新（连接状态、RSSI）
+    Status {
+        connected: bool,
+        rssi: i32,
+        rssi_supported: bool,
+        fast_poll: bool,
+        countdown: i32,
+    },
+    /// 蓝牙事件（连接/断开/信号变化等）
+    Event(BtEvent),
+    /// 连接尝试结果
+    ConnectResult {
+        success: bool,
+        attempt: i32,
+    },
+}
+
+/// 主线程 → 轮询线程 的控制命令
+#[derive(Debug, Clone)]
+enum CtrlCmd {
+    /// 更新配置（阈值、轮询间隔）
+    UpdateConfig { threshold: i32, scan_interval: i32 },
+    /// 执行连接尝试
+    Connect,
+    /// 停止轮询线程
+    Stop,
+}
 
 // ── 常量 ──────────────────────────────────────────────────────────────────
 const MAX_CONNECT_ATTEMPTS: i32 = 3;
@@ -29,7 +64,6 @@ const CONNECT_TIMEOUT_SEC: u64 = 5;
 const CONNECT_ATTEMPT_INTERVAL_SEC: u32 = 5;
 const RETRY_BASE_INTERVAL_SEC: u64 = 10;
 const RETRY_MAX_INTERVAL_SEC: u64 = 60;
-const IDLE_THRESHOLD_MS: u64 = 3000;
 
 // ── 应用状态 ──────────────────────────────────────────────────────────────
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,12 +81,14 @@ struct AppCore {
     config: Config,
     app_state: AppState,
     paused: bool,
-    bt_monitor: Option<BluetoothMonitor>,
-    poller: Option<SmartPoller>,
     tray: TrayIcon,
-    // 连接状态
+    // 连接状态（UI 显示用）
     conn_status: String,
     conn_rssi: i32,
+    // 蓝牙状态缓存（来自轮询线程）
+    current_connected: bool,
+    current_rssi: i32,
+    current_rssi_supported: bool,
     ever_connected: bool,
     lock_abandoned: bool,
     // 自动连接
@@ -68,26 +104,24 @@ struct AppCore {
     // 重连
     retry_pending: bool,
     retry_round_count: i32,
-    // 轮询倒计时（秒），控制动态轮询间隔
-    poll_countdown: i32,
-    // 事件通道
-    event_tx: Option<mpsc::Sender<BtEvent>>,
-    event_rx: Option<mpsc::Receiver<BtEvent>>,
+    // 轮询线程通道
+    poll_rx: Option<mpsc::Receiver<PollMsg>>,
+    ctrl_tx: Option<mpsc::Sender<CtrlCmd>>,
 }
 
 type SharedCore = Arc<Mutex<AppCore>>;
 
 fn new_core(config: Config) -> SharedCore {
-    let (tx, rx) = mpsc::channel();
     Arc::new(Mutex::new(AppCore {
         config,
         app_state: AppState::Idle,
         paused: false,
-        bt_monitor: None,
-        poller: None,
         tray: TrayIcon::new(),
         conn_status: "disconnected".into(),
         conn_rssi: -100,
+        current_connected: false,
+        current_rssi: -100,
+        current_rssi_supported: false,
         ever_connected: false,
         lock_abandoned: false,
         auto_connecting: false,
@@ -99,9 +133,8 @@ fn new_core(config: Config) -> SharedCore {
         low_rssi_consecutive: 0,
         retry_pending: false,
         retry_round_count: 0,
-        poll_countdown: 0,
-        event_tx: Some(tx),
-        event_rx: Some(rx),
+        poll_rx: None,
+        ctrl_tx: None,
     }))
 }
 
@@ -124,6 +157,16 @@ impl AppCore {
         } else if rssi > -90 {
             self.conn_rssi = rssi;
         }
+        // 同步更新托盘状态
+        let tray_state = match status {
+            "connected" => TrayState::Connected,
+            "fading" => TrayState::Fading,
+            "disconnected" => TrayState::Disconnected,
+            "ble_off" => TrayState::BleOff,
+            "reconnecting" => TrayState::Reconnecting,
+            _ => TrayState::Disconnected,
+        };
+        self.tray.update_status(tray_state, self.conn_rssi);
     }
 
     fn cancel_countdown(&mut self) {
@@ -161,11 +204,7 @@ impl AppCore {
         self.countdown_expired = false;
         self.set_state(AppState::Countdown);
         self.countdown_remaining = self.config.lock_delay_sec;
-        let rssi = self
-            .bt_monitor
-            .as_ref()
-            .map(|m| m.current_rssi)
-            .unwrap_or(-100);
+        let rssi = self.current_rssi;
         self.set_conn("fading", rssi);
     }
 
@@ -179,15 +218,10 @@ impl AppCore {
     }
 
     fn start_auto_connect(&mut self) {
-        if self.config.phone_mac.is_empty() || self.bt_monitor.is_none() {
+        if self.config.phone_mac.is_empty() {
             return;
         }
-        if self
-            .bt_monitor
-            .as_ref()
-            .map(|m| m.connected)
-            .unwrap_or(false)
-        {
+        if self.current_connected {
             return;
         }
         self.auto_connecting = true;
@@ -302,6 +336,13 @@ fn main() {
             })
             .build();
 
+        // 关闭窗口时隐藏到任务栏，而非退出程序
+        win.connect_close_request(|win| {
+            win.set_visible(false);
+            log::info!("窗口已隐藏，程序继续在后台运行");
+            gtk::glib::Propagation::Stop
+        });
+
         // ── 构建 UI ──
         let main_box = GtkBox::new(gtk::Orientation::Vertical, 0);
         main_box.set_hexpand(true);
@@ -379,13 +420,42 @@ fn main() {
                 refresh_device_list_ui(&dl, &win, &c, &pc, &pk);
             });
         }
-        // 返回按钮：返回监控页（不更改配置）
+        // 返回按钮：返回监控页，重启监控
         {
+            let c = core.clone();
             let pc = page_container.clone();
             let pk = pick_widgets.container.clone();
+            let mw2 = mw.clone();
             pick_widgets.btn_back.connect_clicked(move |_| {
                 pk.set_visible(false);
                 pc.set_visible(true);
+                // 重启监控（如果已配置设备）
+                let has_device = !c.lock().unwrap().config.phone_mac.is_empty();
+                if has_device {
+                    start_monitoring(&c);
+                    let should_connect = {
+                        let mut c_guard = c.lock().unwrap();
+                        let connected = c_guard.current_connected;
+                        let rssi = c_guard.current_rssi;
+                        if connected {
+                            c_guard.ever_connected = true;
+                            c_guard.set_state(AppState::Monitoring);
+                            c_guard.set_conn("connected", rssi);
+                            false
+                        } else {
+                            c_guard.set_state(AppState::Monitoring);
+                            c_guard.start_auto_connect();
+                            true
+                        }
+                    };
+                    {
+                        let c_guard = c.lock().unwrap();
+                        update_ui(&c_guard, &mw2);
+                    }
+                    if should_connect {
+                        start_connect_attempt(&c);
+                    }
+                }
             });
         }
 
@@ -430,20 +500,9 @@ fn main() {
                     start_monitoring(&core);
                     let should_connect = {
                         let mut c = core.lock().unwrap();
-                        let connected = c
-                            .bt_monitor
-                            .as_mut()
-                            .map(|bt| {
-                                let connected_now = bt.check_connected_now();
-                                bt.connected = connected_now;
-                                connected_now
-                            })
-                            .unwrap_or(false);
-                        let rssi = c
-                            .bt_monitor
-                            .as_ref()
-                            .map(|bt| bt.current_rssi)
-                            .unwrap_or(-100);
+                        // 轮询线程已启动，直接使用缓存状态
+                        let connected = c.current_connected;
+                        let rssi = c.current_rssi;
 
                         if connected {
                             c.ever_connected = true;
@@ -487,8 +546,15 @@ fn main() {
                 let slider = { mw2.lock().unwrap().slider_rssi_threshold.clone() };
                 slider.connect_value_changed(move |s| {
                     let v = s.value() as i32;
-                    c2.lock().unwrap().config.rssi_threshold = v;
-                    c2.lock().unwrap().config.save();
+                    let mut c = c2.lock().unwrap();
+                    c.config.rssi_threshold = v;
+                    c.config.save();
+                    if let Some(tx) = &c.ctrl_tx {
+                        let _ = tx.send(CtrlCmd::UpdateConfig {
+                            threshold: v,
+                            scan_interval: c.config.scan_interval_sec,
+                        });
+                    }
                 });
             }
             // 轮询间隔滑块
@@ -497,8 +563,15 @@ fn main() {
                 let slider = { mw2.lock().unwrap().slider_scan_interval.clone() };
                 slider.connect_value_changed(move |s| {
                     let v = s.value() as i32;
-                    c2.lock().unwrap().config.scan_interval_sec = v;
-                    c2.lock().unwrap().config.save();
+                    let mut c = c2.lock().unwrap();
+                    c.config.scan_interval_sec = v;
+                    c.config.save();
+                    if let Some(tx) = &c.ctrl_tx {
+                        let _ = tx.send(CtrlCmd::UpdateConfig {
+                            threshold: c.config.rssi_threshold,
+                            scan_interval: v,
+                        });
+                    }
                 });
             }
             // 自动锁屏开关
@@ -623,31 +696,48 @@ fn main() {
         }
 
         // ── 定时器 ──
-        // 蓝牙轮询（1秒基础间隔 + 动态倒计时）
+        // 轮询线程消息接收（每50ms检查 channel）
         {
-            let c = core.clone();
+            let core = core.clone();
             let mw2 = mw.clone();
-            glib::timeout_add_seconds_local(1, move || {
-                {
-                    let mut c = c.lock().unwrap();
-                    if matches!(c.app_state, AppState::Idle | AppState::Locking) {
+            glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+                let msgs: Vec<PollMsg> = {
+                    let c = core.lock().unwrap();
+                    if let Some(rx) = &c.poll_rx {
+                        rx.try_iter().collect()
+                    } else {
                         return glib::ControlFlow::Continue;
                     }
-                    if c.poll_countdown > 0 {
-                        c.poll_countdown -= 1;
-                        return glib::ControlFlow::Continue;
+                };
+                for msg in msgs {
+                    match msg {
+                        PollMsg::Status { connected, rssi, rssi_supported, fast_poll: _, countdown: _ } => {
+                            let mut c = core.lock().unwrap();
+                            c.current_connected = connected;
+                            c.current_rssi = rssi;
+                            c.current_rssi_supported = rssi_supported;
+                            if connected {
+                                c.ever_connected = true;
+                                c.set_conn("connected", rssi);
+                            } else if c.app_state == AppState::Monitoring {
+                                c.set_conn("disconnected", -100);
+                            }
+                            update_ui(&c, &mw2);
+                        }
+                        PollMsg::Event(event) => {
+                            handle_bt_event(&core, event, &mw2);
+                        }
+                        PollMsg::ConnectResult { success, attempt: _ } => {
+                            if success {
+                                on_reconnect_success(&core);
+                            } else {
+                                after_connect_failed(&core);
+                            }
+                            let c = core.lock().unwrap();
+                            update_ui(&c, &mw2);
+                        }
                     }
                 }
-                bt_poll_tick(&c, &mw2);
-                glib::ControlFlow::Continue
-            });
-        }
-        // 事件处理（每50ms）
-        {
-            let c = core.clone();
-            let mw_clone = mw.clone();
-            glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
-                process_bt_events(&c, &mw_clone);
                 glib::ControlFlow::Continue
             });
         }
@@ -691,9 +781,6 @@ fn start_monitoring(core: &SharedCore) {
         c.config.auto_connect_device
     );
     let mut bt = BluetoothMonitor::new(&c.config.phone_mac, c.config.rssi_threshold);
-    if let Some(tx) = c.event_tx.take() {
-        bt.set_event_sender(tx);
-    }
     if bt.setup() {
         log::info!("蓝牙监控初始化成功");
     } else {
@@ -701,10 +788,24 @@ fn start_monitoring(core: &SharedCore) {
     }
     let connected = bt.connected;
     let rssi = bt.current_rssi;
-    c.bt_monitor = Some(bt);
+
+    // 创建轮询线程通道
+    let (poll_tx, poll_rx) = mpsc::channel::<PollMsg>();
+    let (ctrl_tx, ctrl_rx) = mpsc::channel::<CtrlCmd>();
+
+    // 创建 SmartPoller 并启动
     let mut poller = SmartPoller::new(c.config.rssi_threshold, c.config.scan_interval_sec);
     poller.start();
-    c.poller = Some(poller);
+
+    // 存储通道到 AppCore
+    c.poll_rx = Some(poll_rx);
+    c.ctrl_tx = Some(ctrl_tx);
+
+    // 启动轮询线程
+    thread::spawn(move || {
+        bt_poll_loop(bt, poller, poll_tx, ctrl_rx);
+    });
+
     c.set_state(AppState::Monitoring);
     if connected {
         c.ever_connected = true;
@@ -720,10 +821,11 @@ fn stop_monitoring(core: &SharedCore) {
     c.ever_connected = false;
     c.cancel_countdown();
     c.stop_auto_connect();
-    if let Some(mut p) = c.poller.take() {
-        p.stop();
+    // 通知轮询线程停止
+    if let Some(tx) = c.ctrl_tx.take() {
+        let _ = tx.send(CtrlCmd::Stop);
     }
-    c.bt_monitor.take();
+    c.poll_rx.take();
     c.set_state(AppState::Idle);
     c.set_conn("disconnected", -100);
 }
@@ -818,22 +920,9 @@ fn update_monitor_device_info(box_widget: &GtkBox, name: &str, mac: &str) {
 
 // ── 蓝牙事件处理 ──────────────────────────────────────────────────────────
 
-fn process_bt_events(core: &SharedCore, mw: &Arc<Mutex<ui::MonitorWidgets>>) {
-    let events: Vec<BtEvent> = {
-        let c = core.lock().unwrap();
-        if let Some(rx) = &c.event_rx {
-            rx.try_iter().collect()
-        } else {
-            return;
-        }
-    };
-    for event in events {
-        handle_bt_event(core, event, mw);
-    }
-}
-
 fn handle_bt_event(core: &SharedCore, event: BtEvent, mw: &Arc<Mutex<ui::MonitorWidgets>>) {
     let mut c = core.lock().unwrap();
+    log::info!("[事件] 收到 {:?}, paused={}, state={:?}", event, c.paused, c.app_state);
     if c.paused {
         return;
     }
@@ -844,11 +933,7 @@ fn handle_bt_event(core: &SharedCore, event: BtEvent, mw: &Arc<Mutex<ui::Monitor
             if c.app_state == AppState::Monitoring {
                 return;
             }
-            let rssi = c
-                .bt_monitor
-                .as_ref()
-                .map(|m| m.current_rssi)
-                .unwrap_or(-100);
+            let rssi = c.current_rssi;
             log::info!("设备已连接: rssi={rssi}dBm, 状态={:?}", c.app_state);
             c.stop_auto_connect();
             c.cancel_countdown();
@@ -876,6 +961,11 @@ fn handle_bt_event(core: &SharedCore, event: BtEvent, mw: &Arc<Mutex<ui::Monitor
             if c.retry_pending {
                 return;
             }
+            // 断开时始终更新连接状态
+            c.set_conn("disconnected", -100);
+            // 启动锁屏倒计时（倒计时中每秒检测用户活动，活跃则取消）
+            c.start_countdown();
+            // 同时尝试自动重连
             if c.config.auto_connect_device && !c.auto_connecting {
                 c.start_auto_connect();
             } else if !c.config.auto_connect_device {
@@ -885,15 +975,10 @@ fn handle_bt_event(core: &SharedCore, event: BtEvent, mw: &Arc<Mutex<ui::Monitor
             update_ui(&c, &mw);
         }
         BtEvent::RssiChanged(rssi) => {
-            if c.paused || c.bt_monitor.as_ref().map(|m| !m.connected).unwrap_or(true) {
+            if c.paused || !c.current_connected {
                 return;
             }
-            if !c
-                .bt_monitor
-                .as_ref()
-                .map(|m| m.rssi_supported)
-                .unwrap_or(true)
-            {
+            if !c.current_rssi_supported {
                 return;
             }
             if matches!(
@@ -943,12 +1028,8 @@ fn handle_bt_event(core: &SharedCore, event: BtEvent, mw: &Arc<Mutex<ui::Monitor
             log::info!("蓝牙适配器已开启");
             if c.app_state == AppState::BleTurnedOff {
                 c.set_state(AppState::Monitoring);
-                if c.bt_monitor.as_ref().map(|m| m.connected).unwrap_or(false) {
-                    let rssi = c
-                        .bt_monitor
-                        .as_ref()
-                        .map(|m| m.current_rssi)
-                        .unwrap_or(-100);
+                if c.current_connected {
+                    let rssi = c.current_rssi;
                     c.set_conn("connected", rssi);
                 } else if c.config.auto_connect_device && !c.config.phone_mac.is_empty() {
                     c.set_conn("reconnecting", -100);
@@ -963,44 +1044,6 @@ fn handle_bt_event(core: &SharedCore, event: BtEvent, mw: &Arc<Mutex<ui::Monitor
     }
 }
 
-// ── 轮询 ──────────────────────────────────────────────────────────────────
-
-fn bt_poll_tick(core: &SharedCore, mw: &Arc<Mutex<ui::MonitorWidgets>>) {
-    let mut c = core.lock().unwrap();
-    if matches!(c.app_state, AppState::Idle | AppState::Locking) {
-        return;
-    }
-    if let Some(bt) = &mut c.bt_monitor {
-        bt.poll_status();
-        let connected = bt.connected;
-        let rssi = bt.filtered_rssi;
-        let rssi_supported = bt.rssi_supported;
-        // 记录 RSSI 到历史
-        if rssi > -90 {
-            crate::log_capture::push_rssi(rssi);
-        }
-        if let Some(poller) = &mut c.poller {
-            let (next_ms, trigger_disconnect) = poller.tick(connected, rssi, rssi_supported);
-            c.poll_countdown = (next_ms / 1000).max(1) as i32;
-            if trigger_disconnect {
-                drop(c);
-                handle_bt_event(core, BtEvent::Disconnected, mw);
-                return;
-            }
-        }
-        if connected {
-            c.ever_connected = true;
-        }
-        // 直接同步连接状态到 UI，不依赖事件通道
-        if connected {
-            c.set_conn("connected", rssi);
-        } else if c.app_state == AppState::Monitoring {
-            c.set_conn("disconnected", rssi);
-        }
-    }
-    update_ui(&c, mw);
-}
-
 // ── 倒计时 ────────────────────────────────────────────────────────────────
 
 fn countdown_tick(core: &SharedCore, _mw: &Arc<Mutex<ui::MonitorWidgets>>) {
@@ -1009,8 +1052,14 @@ fn countdown_tick(core: &SharedCore, _mw: &Arc<Mutex<ui::MonitorWidgets>>) {
         return;
     }
     let idle_ms = locker::get_idle_ms();
-    if idle_ms < IDLE_THRESHOLD_MS {
-        log::info!("检测到用户活动，取消锁屏倒计时");
+    log::debug!(
+        "[倒计时] remaining={}s, idle={:?}ms",
+        c.countdown_remaining, idle_ms
+    );
+    // Some(0) 表示用户刚刚有过操作（鼠标/键盘），取消锁屏
+    // None 表示无法检测（视为用户未活动，允许锁屏）
+    if idle_ms == Some(0) {
+        log::info!("检测到用户活动（idle=0ms），取消锁屏倒计时");
         c.cancel_countdown();
         c.lock_abandoned = true;
         return;
@@ -1029,8 +1078,8 @@ fn do_lock_screen(core: &SharedCore) {
         return;
     }
     let idle_ms = locker::get_idle_ms();
-    if idle_ms < IDLE_THRESHOLD_MS {
-        log::info!("锁屏前检测到用户活动，取消锁屏");
+    if idle_ms == Some(0) {
+        log::info!("锁屏前检测到用户活动（idle=0ms），取消锁屏");
         c.set_state(AppState::Monitoring);
         c.countdown_started = false;
         c.lock_abandoned = true;
@@ -1058,7 +1107,7 @@ fn do_lock_screen(core: &SharedCore) {
 
 fn start_connect_attempt(core: &SharedCore) {
     let mut c = core.lock().unwrap();
-    if c.connecting || c.bt_monitor.is_none() {
+    if c.connecting {
         return;
     }
     if c.auto_connect_attempts >= MAX_CONNECT_ATTEMPTS {
@@ -1066,69 +1115,16 @@ fn start_connect_attempt(core: &SharedCore) {
     }
     c.connecting = true;
     c.auto_connect_attempts += 1;
-    if let Some(bt) = &c.bt_monitor {
-        let (le_proc, br_proc) = bt.start_connect_process(CONNECT_TIMEOUT_SEC);
-        let core_clone = core.clone();
-        glib::spawn_future(async move {
-            poll_connect_result(core_clone, le_proc, br_proc).await;
-        });
+    // 通过 CtrlCmd 通知轮询线程执行连接
+    if let Some(tx) = &c.ctrl_tx {
+        let _ = tx.send(CtrlCmd::Connect);
     }
 }
 
-async fn poll_connect_result(
-    core: SharedCore,
-    mut le_proc: Option<std::process::Child>,
-    mut br_proc: Option<std::process::Child>,
-) {
-    let start = std::time::Instant::now();
-    let timeout = std::time::Duration::from_secs(CONNECT_TIMEOUT_SEC + 10);
-    loop {
-        if start.elapsed() > timeout {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_secs(1));
-        let connected = {
-            let mut c = core.lock().unwrap();
-            c.bt_monitor
-                .as_mut()
-                .map(|bt| bt.check_connected_now())
-                .unwrap_or(false)
-        };
-        if connected {
-            log::info!("连接成功（检测到已连接）");
-            kill_procs(&mut le_proc, &mut br_proc);
-            {
-                core.lock().unwrap().connecting = false;
-            }
-            on_reconnect_success(&core);
-            return;
-        }
-        let le_done = le_proc
-            .as_mut()
-            .map(|p| p.try_wait().ok().flatten().is_some())
-            .unwrap_or(true);
-        let br_done = br_proc
-            .as_mut()
-            .map(|p| p.try_wait().ok().flatten().is_some())
-            .unwrap_or(true);
-        if le_done && br_done {
-            log::info!(
-                "第 {} 次连接失败",
-                core.lock().unwrap().auto_connect_attempts
-            );
-            kill_procs(&mut le_proc, &mut br_proc);
-            {
-                core.lock().unwrap().connecting = false;
-            }
-            after_connect_failed(&core);
-            return;
-        }
+fn kill_child(child: &mut Option<std::process::Child>) {
+    if let Some(mut proc) = child.take() {
+        let _ = proc.kill();
     }
-    kill_procs(&mut le_proc, &mut br_proc);
-    {
-        core.lock().unwrap().connecting = false;
-    }
-    after_connect_failed(&core);
 }
 
 fn kill_procs(le: &mut Option<std::process::Child>, br: &mut Option<std::process::Child>) {
@@ -1149,11 +1145,7 @@ fn on_reconnect_success(core: &SharedCore) {
     c.retry_pending = false;
     if c.app_state == AppState::AutoPaused {
         c.set_state(AppState::Monitoring);
-        let rssi = c
-            .bt_monitor
-            .as_ref()
-            .map(|m| m.filtered_rssi)
-            .unwrap_or(-100);
+        let rssi = c.current_rssi;
         c.set_conn("connected", rssi);
         if c.config.auto_unlock_on_reconnect {
             locker::unlock_session();
@@ -1164,11 +1156,7 @@ fn on_reconnect_success(core: &SharedCore) {
     c.auto_connect_attempts = 0;
     c.cancel_countdown();
     c.set_state(AppState::Monitoring);
-    let rssi = c
-        .bt_monitor
-        .as_ref()
-        .map(|m| m.filtered_rssi)
-        .unwrap_or(-100);
+    let rssi = c.current_rssi;
     c.set_conn("connected", rssi);
     if c.config.auto_unlock_on_reconnect {
         locker::unlock_session();
@@ -1196,11 +1184,10 @@ fn judge_after_unreachable(c: &mut AppCore, core: &SharedCore) {
         return;
     }
     if c.lock_abandoned {
-        // 用户活跃期间跳过锁屏，但仍需安排重试轮次
-        // 当用户停止活动后，清除lock_abandoned允许重新锁屏
+        // 用户活跃期间跳过锁屏，当用户停止活动后（idle>0或无法检测），清除lock_abandoned允许重新锁屏
         let idle_ms = locker::get_idle_ms();
-        if idle_ms >= IDLE_THRESHOLD_MS {
-            log::info!("用户已停止活动，清除lock_abandoned标志，准备重新锁屏");
+        if idle_ms != Some(0) {
+            log::info!("用户已停止活动（idle={:?}ms），清除lock_abandoned标志，准备重新锁屏", idle_ms);
             c.lock_abandoned = false;
             c.start_countdown();
         } else {
@@ -1209,7 +1196,7 @@ fn judge_after_unreachable(c: &mut AppCore, core: &SharedCore) {
         return;
     }
     let idle_ms = locker::get_idle_ms();
-    if idle_ms >= IDLE_THRESHOLD_MS {
+    if idle_ms != Some(0) {
         c.start_countdown();
     } else {
         c.lock_abandoned = true;
@@ -1251,7 +1238,7 @@ fn retry_round(core: &SharedCore) {
         c.retry_round_count = 0;
         return;
     }
-    if c.bt_monitor.as_ref().map(|m| m.connected).unwrap_or(false) {
+    if c.current_connected {
         c.auto_connecting = false;
         c.retry_round_count = 0;
         return;
@@ -1288,4 +1275,136 @@ fn update_ui(c: &AppCore, mw: &Arc<Mutex<ui::MonitorWidgets>>) {
         _ => "active",
     };
     ui::update_toggle_button(&mw.btn_toggle, state_str);
+}
+
+// ── 轮询线程 ──────────────────────────────────────────────────────────────
+
+/// 蓝牙轮询线程主循环
+/// 在独立线程中执行所有阻塞的蓝牙操作，通过 channel 将结果发送到主线程
+fn bt_poll_loop(
+    mut bt: BluetoothMonitor,
+    mut poller: SmartPoller,
+    poll_tx: mpsc::Sender<PollMsg>,
+    ctrl_rx: mpsc::Receiver<CtrlCmd>,
+) {
+    log::info!("[轮询线程] 启动");
+
+    // 跟踪连接进程
+    let mut connect_le: Option<std::process::Child> = None;
+    let mut connect_br: Option<std::process::Child> = None;
+    let mut connect_start: Option<std::time::Instant> = None;
+    // 跟踪上一次连接状态，用于检测变化
+    let mut was_connected = bt.connected;
+
+    loop {
+        // 检查控制命令
+        while let Ok(cmd) = ctrl_rx.try_recv() {
+            match cmd {
+                CtrlCmd::UpdateConfig { threshold, scan_interval } => {
+                    poller.set_threshold(threshold);
+                    poller.set_scan_interval(scan_interval);
+                    log::debug!("[轮询线程] 配置更新: threshold={threshold}, interval={scan_interval}s");
+                }
+                CtrlCmd::Connect => {
+                    log::info!("[轮询线程] 收到连接命令");
+                    let (le, br) = bt.start_connect_process(CONNECT_TIMEOUT_SEC);
+                    connect_le = le;
+                    connect_br = br;
+                    connect_start = Some(std::time::Instant::now());
+                }
+                CtrlCmd::Stop => {
+                    log::info!("[轮询线程] 收到停止命令");
+                    // 清理连接进程
+                    kill_child(&mut connect_le);
+                    kill_child(&mut connect_br);
+                    return;
+                }
+            }
+        }
+
+        // 检查连接进程状态
+        if connect_start.is_some() {
+            let elapsed = connect_start.unwrap().elapsed();
+            let timeout = std::time::Duration::from_secs(CONNECT_TIMEOUT_SEC + 10);
+            let le_done = connect_le.as_mut().map(|p| p.try_wait().ok().flatten().is_some()).unwrap_or(true);
+            let br_done = connect_br.as_mut().map(|p| p.try_wait().ok().flatten().is_some()).unwrap_or(true);
+
+            if elapsed > timeout {
+                log::info!("[轮询线程] 连接超时");
+                kill_child(&mut connect_le);
+                kill_child(&mut connect_br);
+                connect_start = None;
+                let _ = poll_tx.send(PollMsg::ConnectResult { success: false, attempt: 0 });
+            } else if le_done && br_done {
+                // 进程结束，检查是否连上
+                let connected = bt.check_connected_now();
+                bt.connected = connected;
+                kill_child(&mut connect_le);
+                kill_child(&mut connect_br);
+                connect_start = None;
+                if connected {
+                    log::info!("[轮询线程] 连接成功");
+                    let _ = poll_tx.send(PollMsg::ConnectResult { success: true, attempt: 0 });
+                    let _ = poll_tx.send(PollMsg::Event(BtEvent::Connected));
+                } else {
+                    log::info!("[轮询线程] 连接失败");
+                    let _ = poll_tx.send(PollMsg::ConnectResult { success: false, attempt: 0 });
+                }
+            }
+            // 连接过程中仍然继续轮询状态
+        }
+
+        // 执行蓝牙状态轮询（阻塞操作，在线程里无所谓）
+        bt.poll_status();
+
+        let connected = bt.connected;
+        let rssi = bt.filtered_rssi;
+        let rssi_supported = bt.rssi_supported;
+
+        // 记录 RSSI 到历史
+        if rssi > -90 {
+            crate::log_capture::push_rssi(rssi);
+        }
+
+        // 智能轮询计算
+        let (next_ms, trigger_disconnect) = poller.tick(connected, rssi, rssi_supported);
+        let fast = poller.is_fast_polling();
+
+        log::debug!(
+            "[轮询] connected={}, rssi={}dBm, supported={}, fast={}, next_ms={}",
+            connected, rssi, rssi_supported, fast, next_ms
+        );
+
+        // 发送状态更新到主线程
+        let _ = poll_tx.send(PollMsg::Status {
+            connected,
+            rssi,
+            rssi_supported,
+            fast_poll: fast,
+            countdown: (next_ms / 1000).max(1) as i32,
+        });
+
+        // 检测连接状态变化，发送事件
+        if !connected && was_connected {
+            log::info!("[轮询线程] 检测到断开: trigger_disconnect={}, was_connected={}, connected={}", trigger_disconnect, was_connected, connected);
+            let _ = poll_tx.send(PollMsg::Event(BtEvent::Disconnected));
+        } else if connected && !was_connected {
+            log::info!("[轮询线程] 检测到连接");
+            let _ = poll_tx.send(PollMsg::Event(BtEvent::Connected));
+        } else if trigger_disconnect && connected {
+            // RSSI 持续低于阈值，触发远离事件
+            log::info!("[轮询线程] RSSI 低于阈值，触发远离");
+            let _ = poll_tx.send(PollMsg::Event(BtEvent::Disconnected));
+        }
+        was_connected = connected;
+
+        // 检测 RSSI 变化（仅连接且支持 RSSI 时）
+        if connected && rssi_supported && rssi > -90 {
+            let _ = poll_tx.send(PollMsg::Event(BtEvent::RssiChanged(rssi)));
+        }
+
+        // 根据 SmartPoller 返回的间隔 sleep
+        let sleep_ms = next_ms.max(100) as u64; // 最小 100ms
+        thread::sleep(Duration::from_millis(sleep_ms));
+    }
 }
