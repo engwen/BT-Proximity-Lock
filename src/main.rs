@@ -1425,10 +1425,8 @@ fn bt_poll_loop(
         let rssi = bt.filtered_rssi;
         let rssi_supported = bt.rssi_supported;
 
-        // 记录 RSSI 到历史
-        if rssi > -90 {
-            crate::log_capture::push_rssi(rssi);
-        }
+        // 记录 RSSI 到历史（无条件，诊断页面需要完整时间序列）
+        crate::log_capture::push_rssi(rssi);
 
         // 智能轮询计算
         let (next_ms, trigger_disconnect) = poller.tick(connected, rssi, rssi_supported);

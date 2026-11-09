@@ -136,7 +136,16 @@ impl SnIItem {
     async fn scroll(&self, _delta: i32, _orientation: &str) {}
 }
 
-/// DBusMenu D-Bus 接口实现（右键菜单）
+/// DBusMenu 菜单项节点（签名 (ia{sv}av)）
+/// serde::Serialize 是 zbus interface 宏要求的
+#[derive(Debug, serde::Serialize, zbus::zvariant::Type)]
+#[zvariant(signature = "(ia{sv}av)")]
+struct MenuNode {
+    id: i32,
+    properties: std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
+    children: Vec<zbus::zvariant::OwnedValue>,
+}
+
 #[derive(Clone)]
 struct DbusMenu;
 
@@ -157,22 +166,22 @@ impl DbusMenu {
         "normal"
     }
 
-    /// 返回菜单布局
+    /// 返回菜单布局，签名必须是 (u(ia{sv}av))
     fn get_layout(
         &self,
         parent_id: i32,
         _recursion_depth: i32,
         _property_names: Vec<String>,
-    ) -> (u32, OwnedValue) {
+    ) -> (u32, MenuNode) {
+        let revision: u32 = 1;
         if parent_id == 0 {
-            let revision: u32 = 1;
-            let item = make_menu_item(0, "", vec![
-                make_menu_item(1, "显示窗口", vec![]),
-                make_menu_item(2, "退出", vec![]),
+            let node = make_menu_node(0, "", vec![
+                make_menu_node(1, "显示窗口", vec![]),
+                make_menu_node(2, "退出", vec![]),
             ]);
-            return (revision, item);
+            return (revision, node);
         }
-        (0u32, OwnedValue::from(0i32))
+        (revision, make_menu_node(parent_id, "", vec![]))
     }
 
     fn about_to_show(&self, _id: i32) -> bool {
@@ -201,38 +210,30 @@ impl DbusMenu {
     }
 }
 
-/// 创建菜单项
-/// 为兼容 libdbusmenu，叶子项补 "type":"standard"，根项补 "children-display":"submenu"，
-/// 否则部分桌面环境会把菜单渲染成 "…" 或不显示。
-fn make_menu_item(id: i32, label: &str, children: Vec<OwnedValue>) -> OwnedValue {
-    let key_sig = Signature::from_static_str_unchecked("s");
-    let val_sig = Signature::from_static_str_unchecked("v");
-    let mut dict = Dict::new(key_sig, val_sig);
+/// 创建菜单节点
+/// children 需要包成 OwnedValue (Variant) 因为 DBusMenu 签名是 av (array<variant>)
+fn make_menu_node(
+    id: i32,
+    label: &str,
+    children: Vec<MenuNode>,
+) -> MenuNode {
+    let mut props: std::collections::HashMap<String, zbus::zvariant::OwnedValue> =
+        std::collections::HashMap::new();
     if !label.is_empty() {
-        dict.add(Str::from("label"), Value::from(Str::from(label.to_string())))
-            .unwrap();
+        let v: zbus::zvariant::Value<'_> = zbus::zvariant::Value::from(label);
+        let owned = zbus::zvariant::OwnedValue::try_from(v).unwrap();
+        props.insert("label".to_string(), owned);
     }
-    if id == 0 && !children.is_empty() {
-        dict.add(
-            Str::from("children-display"),
-            Value::from(Str::from("submenu")),
-        )
-        .unwrap();
-    } else if id != 0 {
-        dict.add(Str::from("type"), Value::from(Str::from("standard")))
-            .unwrap();
-    }
-    let child_values: Vec<Value<'static>> = children
+    // 每个子 MenuNode → OwnedValue (Variant 包装的 Structure)
+    let child_variants: Vec<zbus::zvariant::OwnedValue> = children
         .into_iter()
-        .map(Value::from)
+        .map(|node| {
+            let s = zbus::zvariant::Structure::from((node.id, node.properties, node.children));
+            let val: zbus::zvariant::Value<'_> = zbus::zvariant::Value::from(s);
+            zbus::zvariant::OwnedValue::try_from(val).unwrap()
+        })
         .collect();
-    let arr = Array::from(child_values);
-    let s = StructureBuilder::new()
-        .add_field(id)
-        .append_field(Value::Dict(dict))
-        .append_field(Value::Array(arr))
-        .build();
-    OwnedValue::try_from(s).unwrap()
+    MenuNode { id, properties: props, children: child_variants }
 }
 
 /// 生成 24x24 应用图标像素数据
@@ -389,27 +390,20 @@ impl TrayBackend for SnITray {
 }
 
 /// 运行 SNI + DBusMenu D-Bus 服务
+/// AppIndicator 硬编码期望 /StatusNotifierItem 和 /Menu，所以直接注册这两个路径。
 async fn run_sni_service(
     state: Arc<Mutex<SnIState>>,
     bus_name: &str,
 ) -> zbus::Result<()> {
-    // AppIndicator 硬编码期望 /StatusNotifierItem 和 /Menu
-    // 其他环境用自定义路径
-    let menu_path = "/org/btproximitylock/menu";
-
     let item = SnIItem {
         state: state.clone(),
-        menu_path: menu_path.to_string(),
+        menu_path: "/Menu".to_string(),
     };
-    let item2 = item.clone();
     let menu = DbusMenu;
-    let menu2 = DbusMenu;
 
     let conn = Builder::session()?
         .serve_at("/StatusNotifierItem", item)?
-        .serve_at("/org/btproximitylock/StatusNotifierItem", item2)?
         .serve_at("/Menu", menu)?
-        .serve_at(menu_path, menu2)?
         .build()
         .await?;
 
@@ -421,7 +415,7 @@ async fn run_sni_service(
     // 注册到 StatusNotifierWatcher
     register_with_watcher(bus_name, &conn).await;
 
-    log::info!("SNI + DBusMenu 服务运行中: item_paths=[/StatusNotifierItem, /org/btproximitylock/StatusNotifierItem], menu_paths=[/Menu, {menu_path}]");
+    log::info!("SNI + DBusMenu 服务运行中: /StatusNotifierItem + /Menu");
 
     // 保持服务运行
     loop {
