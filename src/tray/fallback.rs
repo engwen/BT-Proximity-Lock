@@ -1,14 +1,16 @@
-/// 回退托盘实现 — 适用于 GNOME / Deepin 等不支持传统托盘的环境
+/// 回退托盘实现 — 适用于 GNOME 等不支持传统托盘的环境
 /// 通过窗口隐藏到任务栏实现，用户可从任务栏恢复窗口
-use super::{TrayBackend, TrayState};
+use std::sync::mpsc;
+use super::{TrayAction, TrayBackend, TrayState};
 
 pub struct FallbackTray {
-    paused: bool,
+    #[allow(dead_code)]
+    action_tx: Option<mpsc::Sender<TrayAction>>,
 }
 
 impl FallbackTray {
     pub fn new() -> Self {
-        Self { paused: false }
+        Self { action_tx: None }
     }
 }
 
@@ -19,7 +21,6 @@ impl TrayBackend for FallbackTray {
     }
 
     fn update_status(&mut self, state: TrayState, rssi: i32) {
-        // 回退模式下通过日志通知状态变化
         match state {
             TrayState::Connected => {
                 log::debug!("[托盘] 已连接, 信号: {rssi}dBm");
@@ -34,8 +35,8 @@ impl TrayBackend for FallbackTray {
         }
     }
 
-    fn set_paused(&mut self, paused: bool) {
-        self.paused = paused;
+    fn set_action_sender(&mut self, tx: mpsc::Sender<TrayAction>) {
+        self.action_tx = Some(tx);
     }
 
     fn stop(&mut self) {

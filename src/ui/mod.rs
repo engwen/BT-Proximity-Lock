@@ -7,6 +7,7 @@ use std::rc::Rc;
 
 use crate::config::Config;
 use crate::i18n::tr;
+use crate::log_capture;
 use crate::scanner::DeviceInfo;
 
 // ── GTK4 CSS（深色主题 + 原版配色）───────────────────────────────────────
@@ -760,7 +761,7 @@ pub struct SettingsValues {
 }
 
 /// 显示运行日志弹窗（含 RSSI 信号曲线）
-pub fn show_log_dialog(log_text: &str, rssi_curve: &str) {
+pub fn show_log_dialog() {
     let dialog = gtk::Window::builder()
         .title(&tr("test_title"))
         .default_width(750)
@@ -785,7 +786,6 @@ pub fn show_log_dialog(log_text: &str, rssi_curve: &str) {
     let curve_view = gtk::TextView::new();
     curve_view.set_editable(false);
     curve_view.set_monospace(true);
-    curve_view.buffer().set_text(rssi_curve);
     curve_view.add_css_class("log-textview");
     curve_scroll.set_child(Some(&curve_view));
     vbox.append(&curve_scroll);
@@ -808,7 +808,6 @@ pub fn show_log_dialog(log_text: &str, rssi_curve: &str) {
     text_view.set_editable(false);
     text_view.set_monospace(true);
     text_view.set_wrap_mode(gtk::WrapMode::WordChar);
-    text_view.buffer().set_text(log_text);
     text_view.add_css_class("log-textview");
     scroll.set_child(Some(&text_view));
     vbox.append(&scroll);
@@ -816,13 +815,47 @@ pub fn show_log_dialog(log_text: &str, rssi_curve: &str) {
     // 关闭按钮
     let btn_close = Button::with_label("关闭");
     btn_close.set_halign(gtk::Align::End);
-    let dialog_ref = dialog.clone();
+    let dialog_close = dialog.clone();
     btn_close.connect_clicked(move |_| {
-        dialog_ref.close();
+        dialog_close.close();
     });
     vbox.append(&btn_close);
 
     dialog.set_child(Some(&vbox));
+
+    // 初始加载
+    let logs = log_capture::get_logs();
+    text_view.buffer().set_text(&logs);
+    let history = log_capture::get_rssi_history();
+    let curve = log_capture::render_rssi_curve(&history, 70, 10);
+    curve_view.buffer().set_text(&curve);
+
+    // 自动滚动到底部
+    let adj = scroll.vadjustment();
+    adj.set_value(adj.upper());
+
+    // 定时刷新（每 1 秒）
+    let tv = text_view.clone();
+    let cv = curve_view.clone();
+    let sc = scroll.clone();
+    let dialog_ref = dialog.clone();
+    gtk::glib::timeout_add_seconds_local(1, move || {
+        if !dialog_ref.is_visible() {
+            return gtk::glib::ControlFlow::Break;
+        }
+        // 刷新日志
+        let logs = log_capture::get_logs();
+        tv.buffer().set_text(&logs);
+        // 刷新曲线
+        let history = log_capture::get_rssi_history();
+        let curve = log_capture::render_rssi_curve(&history, 70, 10);
+        cv.buffer().set_text(&curve);
+        // 自动滚动到底部
+        let adj = sc.vadjustment();
+        adj.set_value(adj.upper());
+        gtk::glib::ControlFlow::Continue
+    });
+
     dialog.present();
 }
 

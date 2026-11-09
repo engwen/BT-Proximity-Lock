@@ -35,8 +35,8 @@ pub struct BluetoothMonitor {
         pending_conn: Option<bool>,
         /// 稳定连接状态，确认后更新，用于 RSSI 查询
         stable_connected: bool,
-    // 事件通道
-    event_tx: Option<mpsc::Sender<BtEvent>>,
+    // 事件通道（与主轮询结果共用 PollMsg 通道，便于主线程统一处理）
+    event_tx: Option<mpsc::Sender<crate::PollMsg>>,
 }
 
 struct DeviceProps {
@@ -46,6 +46,10 @@ struct DeviceProps {
 
 impl BluetoothMonitor {
     pub fn new(mac: &str, rssi_threshold: i32) -> Self {
+        // BlueZ 设备对象路径里的 MAC 大小写随系统/配对时写法而定（本机实测为大写
+        // 如 dev_8C_7A_3D_2D_26_FF），这里统一归一化为大写（bluetoothctl 同样接受）。
+        // 真正的路径匹配在 find_device_om 中采用大小写不敏感方式，并保留 BlueZ 真实
+        // 返回的路径原文，因此后续 D-Bus 调用兼容大小写两种写法。
         Self {
             mac: mac.to_uppercase().replace('-', ":"),
             rssi_threshold,
@@ -54,7 +58,7 @@ impl BluetoothMonitor {
             device_path: String::new(),
             adapter_powered: true,
             filtered_rssi: -100,
-            rssi_supported: true,
+            rssi_supported: false,
             rssi_samples: VecDeque::with_capacity(8),
             conn_confirm_count: 0,
             pending_conn: None,
@@ -63,13 +67,13 @@ impl BluetoothMonitor {
         }
     }
 
-    pub fn set_event_sender(&mut self, tx: mpsc::Sender<BtEvent>) {
+    pub fn set_event_sender(&mut self, tx: mpsc::Sender<crate::PollMsg>) {
         self.event_tx = Some(tx);
     }
 
     fn send_event(&self, event: BtEvent) {
         if let Some(tx) = &self.event_tx {
-            let _ = tx.send(event);
+            let _ = tx.send(crate::PollMsg::Event(event));
         }
     }
 
@@ -111,7 +115,9 @@ impl BluetoothMonitor {
         let props = self.get_device_props();
         self.connected = props.connected.unwrap_or(false);
         self.stable_connected = self.connected;
-        self.update_rssi(props.rssi.unwrap_or(-100));
+        if let Some(r) = props.rssi {
+            self.update_rssi(r);
+        }
         log::info!(
             "蓝牙监控就绪 - 设备: {} 连接: {} RSSI: {}",
             self.device_path,
@@ -144,16 +150,11 @@ impl BluetoothMonitor {
         if self.device_path.is_empty() {
             self.device_path = self.find_device();
             if self.device_path.is_empty() {
-                // 使用 bluetoothctl 兜底
+                // 使用 bluetoothctl 兜底（连接状态变化由轮询循环统一上报，这里只更新内部状态）
                 let connected = self.get_connected_via_bluetoothctl();
                 if let Some(c) = connected {
                     if c != self.connected {
                         self.connected = c;
-                        if c {
-                            self.send_event(BtEvent::Connected);
-                        } else {
-                            self.send_event(BtEvent::Disconnected);
-                        }
                     }
                 }
                 return;
@@ -161,7 +162,7 @@ impl BluetoothMonitor {
         }
         let props = self.get_device_props();
         let new_connected = props.connected.unwrap_or(false);
-        // 去抖动处理
+        // 去抖动处理（仅更新内部状态，连接/断开事件由轮询主循环统一上报，避免重复）
         if new_connected == self.connected {
             self.pending_conn = None;
             self.conn_confirm_count = 0;
@@ -179,19 +180,19 @@ impl BluetoothMonitor {
                 self.pending_conn = None;
                 self.conn_confirm_count = 0;
                 log::info!("[轮询] 连接状态确认变化: {old} -> {new_connected}");
-                if new_connected {
-                    self.send_event(BtEvent::Connected);
-                } else {
-                    self.send_event(BtEvent::Disconnected);
-                }
             }
         }
-        // RSSI 只在设备已连接时读取，避免断开后读到虚假值
+        // RSSI 只在设备已连接且 BlueZ 暴露了真实值时读取，避免断开后读到虚假值
         if self.connected {
-            let old_rssi = self.current_rssi;
-            self.update_rssi(props.rssi.unwrap_or(-100));
-            if self.current_rssi != old_rssi {
-                self.send_event(BtEvent::RssiChanged(self.current_rssi));
+            match props.rssi {
+                Some(raw) => {
+                    self.update_rssi(raw);
+                }
+                None => {
+                    // BlueZ 未暴露 RSSI（现代 BlueZ 对已连接设备常如此）。
+                    // 必须如实标记不支持，否则 -100 会被当成“低于阈值”而误触发锁屏。
+                    self.rssi_supported = false;
+                }
             }
             self.stable_connected = true;
         } else {
@@ -245,9 +246,14 @@ impl BluetoothMonitor {
         props.connected.unwrap_or(false)
     }
 
+    /// 是否正在经历状态变化（去抖动进行中，尚未确认）
+    pub fn is_state_changing(&self) -> bool {
+        self.pending_conn.is_some() && self.conn_confirm_count > 0
+    }
+
     /// 断开指定蓝牙外设
     pub fn disconnect_peripheral(&self, mac: &str) -> bool {
-        let path_suffix = mac.replace(':', "_");
+        let path_suffix = mac.to_uppercase().replace(':', "_");
         let device_path = format!("/org/bluez/hci0/dev_{path_suffix}");
         let result = Command::new("gdbus")
             .args([
@@ -320,9 +326,9 @@ impl BluetoothMonitor {
             if out.status.success() {
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 let path_suffix = self.mac.replace(':', "_");
-                let target = format!("dev_{path_suffix}");
+                let target = format!("dev_{path_suffix}").to_lowercase();
                 for line in stdout.lines() {
-                    if line.contains(&target) {
+                    if line.to_lowercase().contains(&target) {
                         // 提取路径
                         if let Some(start) = line.find("'/org/bluez/") {
                             let rest = &line[start + 1..];
@@ -342,33 +348,29 @@ impl BluetoothMonitor {
             connected: None,
             rssi: None,
         };
-        // Connected: D-Bus + bluetoothctl 双重检查
-        let connected_dbus = self.get_connected_via_dbus();
+        // 通过 BlueZ D-Bus GetAll 同时读取 Connected 与 RSSI
+        // 不再依赖 hcitool（BlueZ ≥ 5.66 / Ubuntu 24.04 已移除）
+        if let Some(raw) = self.get_device_props_raw() {
+            props.connected = Self::parse_connected(&raw);
+            props.rssi = Self::parse_rssi(&raw);
+        }
+        // 再用 bluetoothctl 双重校验连接状态，避免个别环境下 D-Bus 缓存滞后
         let connected_ctl = self.get_connected_via_bluetoothctl();
-        if let (Some(dbus), Some(ctl)) = (connected_dbus, connected_ctl) {
+        if let (Some(dbus), Some(ctl)) = (props.connected, connected_ctl) {
             if dbus != ctl {
                 log::warn!(
                     "连接状态检测不一致: D-Bus={dbus}, bluetoothctl={ctl}，采用bluetoothctl"
                 );
                 props.connected = Some(ctl);
-            } else {
-                props.connected = Some(dbus);
             }
         } else if let Some(c) = connected_ctl {
             props.connected = Some(c);
-        } else {
-            props.connected = connected_dbus;
-        }
-        // RSSI via HCI
-        if let Some(handle) = self.get_conn_handle() {
-            if let Some(rssi) = self.read_rssi_hci(handle) {
-                props.rssi = Some(rssi);
-            }
         }
         props
     }
 
-    fn get_connected_via_dbus(&self) -> Option<bool> {
+    /// 读取设备全部属性（GetAll）的原始文本
+    fn get_device_props_raw(&self) -> Option<String> {
         if self.device_path.is_empty() {
             return None;
         }
@@ -384,27 +386,33 @@ impl BluetoothMonitor {
                 &format!("{PROPS_IF}.GetAll"),
                 DEVICE_IF,
             ])
-            .output();
-        match output {
-            Ok(out) => {
-                if !out.status.success() {
-                    return None;
-                }
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                if stdout.contains("'Connected': <true>")
-                    || stdout.contains("\"Connected\": <true>")
-                {
-                    Some(true)
-                } else if stdout.contains("'Connected': <false>")
-                    || stdout.contains("\"Connected\": <false>")
-                {
-                    Some(false)
-                } else {
-                    None
-                }
-            }
-            Err(_) => None,
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
         }
+        Some(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
+    fn parse_connected(raw: &str) -> Option<bool> {
+        if raw.contains("'Connected': <true>") || raw.contains("\"Connected\": <true>") {
+            Some(true)
+        } else if raw.contains("'Connected': <false>") || raw.contains("\"Connected\": <false>") {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    /// 解析 BlueZ Device1.RSSI 属性（D-Bus GetAll 输出）
+    /// 兼容 'RSSI': < -55 > 与 "RSSI": < -55 > 两种引号风格
+    fn parse_rssi(raw: &str) -> Option<i32> {
+        let marker = raw.find("'RSSI'").or_else(|| raw.find("\"RSSI\""))?;
+        let s = &raw[marker..];
+        let open = s.find('<')?;
+        let close = s[open..].find('>')?;
+        let val = s[open + 1..open + close].trim();
+        val.parse::<i32>().ok()
     }
 
     fn get_connected_via_bluetoothctl(&self) -> Option<bool> {
@@ -426,58 +434,6 @@ impl BluetoothMonitor {
             }
             Err(_) => None,
         }
-    }
-
-    fn get_conn_handle(&self) -> Option<i32> {
-        let output = Command::new("hcitool").arg("con").output().ok()?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut le_handle: Option<i32> = None;
-        let mut acl_handle: Option<i32> = None;
-        for line in stdout.lines() {
-            if line.to_lowercase().contains(&self.mac.to_lowercase()) {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if let Some(idx) = parts.iter().position(|p| *p == "handle") {
-                    if idx + 1 < parts.len() {
-                        if let Ok(h) = parts[idx + 1].parse::<i32>() {
-                            if line.contains("< LE") {
-                                le_handle = Some(h);
-                            } else {
-                                acl_handle = Some(h);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        le_handle.or(acl_handle)
-    }
-
-    fn read_rssi_hci(&self, handle: i32) -> Option<i32> {
-        let h = handle & 0xFFF;
-        let cmd = format!("0x{:02x}", h & 0xFF);
-        let cmd2 = format!("0x{:02x}", (h >> 8) & 0xFF);
-        let output = Command::new("hcitool")
-            .args(["cmd", "0x05", "0x0005", &cmd, &cmd2])
-            .output()
-            .ok()?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            let line = line.trim();
-            if !line.starts_with("> HCI Event:") && !line.starts_with('>') {
-                let bytes: Vec<&str> = line.split_whitespace().collect();
-                if bytes.len() >= 7 {
-                    if let Ok(rssi_byte) = u8::from_str_radix(bytes.last()?, 16) {
-                        let rssi = if rssi_byte > 127 {
-                            rssi_byte as i32 - 256
-                        } else {
-                            rssi_byte as i32
-                        };
-                        return Some(rssi);
-                    }
-                }
-            }
-        }
-        None
     }
 
     fn get_adapter_powered(&self) -> Option<bool> {
@@ -516,5 +472,35 @@ impl BluetoothMonitor {
             }
         }
         "/org/bluez/hci0".into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_rssi_single_quotes() {
+        let raw = "({ 'Address': <'AA:BB:CC:DD:EE:FF'>, 'Connected': <true>, 'RSSI': < -55 >, 'Name': <'Phone'> },)";
+        assert_eq!(BluetoothMonitor::parse_rssi(raw), Some(-55));
+    }
+
+    #[test]
+    fn parse_rssi_double_quotes() {
+        let raw = "( { \"Connected\": <false>, \"RSSI\": < -42 > }, )";
+        assert_eq!(BluetoothMonitor::parse_rssi(raw), Some(-42));
+    }
+
+    #[test]
+    fn parse_rssi_absent() {
+        let raw = "({ 'Connected': <true> },)";
+        assert_eq!(BluetoothMonitor::parse_rssi(raw), None);
+    }
+
+    #[test]
+    fn parse_connected_variants() {
+        assert_eq!(BluetoothMonitor::parse_connected("'Connected': <true>"), Some(true));
+        assert_eq!(BluetoothMonitor::parse_connected("\"Connected\": <false>"), Some(false));
+        assert_eq!(BluetoothMonitor::parse_connected("no connected field"), None);
     }
 }

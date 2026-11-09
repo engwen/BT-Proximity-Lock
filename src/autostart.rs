@@ -23,10 +23,14 @@ pub fn enable_autostart() -> bool {
         log::error!("创建 service 目录失败: {e}");
         return false;
     }
-    let python_bin = std::env::var("PYTHON_BIN").unwrap_or_else(|_| "python3".into());
-    let work_dir = std::env::current_dir()
+    // 直接以当前运行的可执行文件路径作为启动命令（本项目是 Rust 二进制，
+    // 而非 python 模块）。回退到常见安装路径。
+    let exe_path = std::env::current_exe()
         .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
+        .unwrap_or_else(|_| "/usr/bin/bt-proximity-lock".into());
+    let home_dir = dirs::home_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| "/home".into());
     let content = format!(
         r#"[Unit]
 Description=BT Proximity Lock - Bluetooth Proximity Auto Lock
@@ -34,8 +38,8 @@ After=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart={python_bin} -m bt_proximity_lock
-WorkingDirectory={work_dir}
+ExecStart={exe_path}
+WorkingDirectory={home_dir}
 Restart=on-failure
 RestartSec=5
 Environment=DISPLAY=:0

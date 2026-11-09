@@ -38,28 +38,39 @@ pub fn get_logs() -> String {
     }
 }
 
-/// 生成 RSSI 信号曲线的文本可视化
+/// 生成 RSSI 信号曲线的文本可视化（带移动平均平滑）
 pub fn render_rssi_curve(history: &[i32], width: usize, height: usize) -> String {
     if history.is_empty() {
         return "暂无 RSSI 数据，启动监控后自动采集".to_string();
     }
 
     // 取最后 width 个点
-    let data: Vec<i32> = if history.len() > width {
+    let raw: Vec<i32> = if history.len() > width {
         history[history.len() - width..].to_vec()
     } else {
         history.to_vec()
     };
 
-    let min_val = data.iter().copied().min().unwrap_or(-100).min(-100);
-    let max_val = data.iter().copied().max().unwrap_or(-30).max(-30);
-    let range = (max_val - min_val).max(1);
+    // 移动平均平滑（窗口=3）
+    let data: Vec<f64> = raw
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| {
+            let start = if i >= 2 { i - 2 } else { 0 };
+            let slice = &raw[start..=i];
+            slice.iter().sum::<i32>() as f64 / slice.len() as f64
+        })
+        .collect();
+
+    let min_val = data.iter().cloned().fold(f64::INFINITY, f64::min).min(-100.0);
+    let max_val = data.iter().cloned().fold(f64::NEG_INFINITY, f64::max).max(-30.0);
+    let range = (max_val - min_val).max(1.0);
 
     // 构建画布
     let mut canvas = vec![vec![' '; width]; height];
 
     for (x, &val) in data.iter().enumerate() {
-        let normalized = (val - min_val) as f64 / range as f64;
+        let normalized = (val - min_val) / range;
         let y = ((1.0 - normalized) * (height - 1) as f64).round() as usize;
         let y = y.min(height - 1);
         canvas[y][x] = '●';
@@ -76,20 +87,18 @@ pub fn render_rssi_curve(history: &[i32], width: usize, height: usize) -> String
     }
 
     let mut lines = Vec::new();
-    // Y 轴标签（顶部、中间、底部）
     for (row_idx, row) in canvas.iter().enumerate() {
         let label = match row_idx {
-            0 => format!("{:>4} |", max_val),
-            r if r == height / 2 => format!("{:>4} |", (max_val + min_val) / 2),
-            r if r == height - 1 => format!("{:>4} |", min_val),
+            0 => format!("{:>4} |", max_val as i32),
+            r if r == height / 2 => format!("{:>4} |", ((max_val + min_val) / 2.0) as i32),
+            r if r == height - 1 => format!("{:>4} |", min_val as i32),
             _ => "     |".to_string(),
         };
         let line: String = row.iter().collect();
         lines.push(format!("{label}{line}"));
     }
-    // X 轴
     lines.push(format!("     +{}", "-".repeat(width)));
-    lines.push(format!("      {}个数据点，最新: {} dBm", data.len(), data.last().unwrap_or(&0)));
+    lines.push(format!("      {}个数据点，最新: {:.0} dBm (平滑)", data.len(), data.last().unwrap_or(&0.0)));
     lines.join("\n")
 }
 
@@ -133,21 +142,21 @@ impl Log for CaptureLogger {
     }
 }
 
-/// 简单的时间戳生成（避免引入 chrono 依赖）
+/// 简单的时间戳生成（UTC+8 东八区）
 fn chrono_like_timestamp() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    // 简化为 UTC 时间戳
-    let days = secs / 86400;
-    let time_of_day = secs % 86400;
+    // 转换为东八区（+8 小时）
+    let secs_cst = secs + 8 * 3600;
+    let days = secs_cst / 86400;
+    let time_of_day = secs_cst % 86400;
     let h = time_of_day / 3600;
     let m = (time_of_day % 3600) / 60;
     let s = time_of_day % 60;
-    // 从 epoch 天数计算年月日（近似）
     let (y, mo, d) = epoch_days_to_ymd(days);
-    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}+08")
 }
 
 fn epoch_days_to_ymd(days: u64) -> (u64, u64, u64) {

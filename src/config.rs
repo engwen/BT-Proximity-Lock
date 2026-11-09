@@ -165,8 +165,4 @@ impl Config {
             Err(e) => log::error!("序列化配置失败: {e}"),
         }
     }
-
-    pub fn phone_mac_formatted(&self) -> String {
-        self.phone_mac.to_uppercase().replace('-', ":")
-    }
 }

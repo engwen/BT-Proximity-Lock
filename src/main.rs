@@ -23,7 +23,7 @@ use bluetooth_monitor::{BluetoothMonitor, BtEvent};
 use config::Config;
 use i18n::{detect_language, set_lang, tr};
 use poller::SmartPoller;
-use tray::{TrayIcon, TrayState};
+use tray::{TrayIcon, TrayAction, TrayState};
 
 // ── 轮询线程消息类型 ────────────────────────────────────────────────────
 
@@ -267,7 +267,6 @@ fn main() {
 
     let mut cfg = Config::load();
     let args: Vec<String> = std::env::args().collect();
-    let non_unique_instance = args.iter().any(|arg| arg == "--new-instance");
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -330,11 +329,15 @@ fn main() {
                     &phone_name
                 }
             ))
-            .default_width({
-                let c = core.lock().unwrap();
-                c.config.window_width
-            })
-            .build();
+        .default_width({
+            let c = core.lock().unwrap();
+            c.config.window_width
+        })
+        .default_height({
+            let c = core.lock().unwrap();
+            c.config.window_height
+        })
+        .build();
 
         // 关闭窗口时隐藏到任务栏，而非退出程序
         win.connect_close_request(|win| {
@@ -374,6 +377,7 @@ fn main() {
         let mw_holder: Rc<RefCell<Option<Arc<Mutex<ui::MonitorWidgets>>>>> =
             Rc::new(RefCell::new(None));
         let mw_holder2: Rc<RefCell<Option<Arc<Mutex<ui::MonitorWidgets>>>>> = mw_holder.clone();
+        let mw_holder3: Rc<RefCell<Option<Arc<Mutex<ui::MonitorWidgets>>>>> = mw_holder.clone();
         let mw: Arc<Mutex<ui::MonitorWidgets>> = Arc::new(Mutex::new(ui::build_monitor_page(
             {
                 let c = core.clone();
@@ -391,6 +395,7 @@ fn main() {
                 let win = win.clone();
                 let pc = page_container.clone();
                 let pk = pick_widgets.container.clone();
+                let mh = mw_holder3;
                 move || {
                     stop_monitoring(&c);
                     pc.set_visible(false);
@@ -401,9 +406,12 @@ fn main() {
                     let w2 = win.clone();
                     let pc2 = pc.clone();
                     let pk2 = pk.clone();
+                    let mh2 = mh.clone();
                     let on_select: Rc<RefCell<Box<dyn Fn(&scanner::DeviceInfo)>>> =
                         Rc::new(RefCell::new(Box::new(move |dev| {
-                            select_device_from_pick(&c2, &w2, &pc2, &pk2, dev);
+                            if let Some(mw_ref) = mh2.borrow().as_ref() {
+                                select_device_from_pick(&c2, &w2, &pc2, &pk2, mw_ref, dev);
+                            }
                         })));
                     ui::update_device_list(&dl, &devices, on_select);
                 }
@@ -416,8 +424,9 @@ fn main() {
             let win = win.clone();
             let pc = page_container.clone();
             let pk = pick_widgets.container.clone();
+            let mw_refresh = mw.clone();
             pick_widgets.btn_refresh.connect_clicked(move |_| {
-                refresh_device_list_ui(&dl, &win, &c, &pc, &pk);
+                refresh_device_list_ui(&dl, &win, &c, &pc, &pk, &mw_refresh);
             });
         }
         // 返回按钮：返回监控页，重启监控
@@ -482,7 +491,7 @@ fn main() {
                 let c2 = core.clone();
                 let pc2 = page_container.clone();
                 let pk2 = pick_widgets.container.clone();
-                refresh_device_list_ui(&dl, &w2, &c2, &pc2, &pk2);
+                refresh_device_list_ui(&dl, &w2, &c2, &pc2, &pk2, &mw);
             } else {
                 drop(c);
                 pick_widgets.container.set_visible(false);
@@ -687,10 +696,7 @@ fn main() {
             {
                 let btn = { mw3.lock().unwrap().btn_log.clone() };
                 btn.connect_clicked(move |_| {
-                    let logs = crate::log_capture::get_logs();
-                    let rssi_history = crate::log_capture::get_rssi_history();
-                    let curve = crate::log_capture::render_rssi_curve(&rssi_history, 80, 12);
-                    ui::show_log_dialog(&logs, &curve);
+                    ui::show_log_dialog();
                 });
             }
         }
@@ -750,10 +756,37 @@ fn main() {
                 glib::ControlFlow::Continue
             });
         }
-        // 启动托盘
+        // 启动托盘，并处理托盘动作（显示窗口/退出）
         {
             let mut c = core.lock().unwrap();
             c.tray.start();
+        }
+        // 获取托盘动作接收器
+        let action_rx = core.lock().unwrap().tray.take_action_receiver();
+        if let Some(rx) = action_rx {
+            let win_ref = win.clone();
+            let app_ref = application.clone();
+            let c = core.clone();
+            gtk::glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
+                match rx.try_recv() {
+                    Ok(TrayAction::Show) => {
+                        log::info!("托盘动作: 显示窗口");
+                        win_ref.set_visible(true);
+                        win_ref.present();
+                    }
+                    Ok(TrayAction::Quit) => {
+                        log::info!("托盘动作: 退出程序");
+                        c.lock().unwrap().tray.stop();
+                        app_ref.quit();
+                        return gtk::glib::ControlFlow::Break;
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        return gtk::glib::ControlFlow::Break;
+                    }
+                    _ => {}
+                }
+                gtk::glib::ControlFlow::Continue
+            });
         }
 
         win.present();
@@ -774,6 +807,14 @@ fn start_monitoring(core: &SharedCore) {
     if c.config.phone_mac.is_empty() {
         return;
     }
+    // 若已经在监控，先停掉旧的轮询线程，避免重复轮询 / 双线程
+    if c.ctrl_tx.is_some() {
+        if let Some(tx) = c.ctrl_tx.take() {
+            let _ = tx.send(CtrlCmd::Stop);
+        }
+        c.poll_rx.take();
+        log::info!("检测到已有监控线程，已发送停止信号，准备重启");
+    }
     log::info!(
         "启动监控: device={}, auto_lock={}, auto_connect={}",
         c.config.phone_mac,
@@ -792,6 +833,10 @@ fn start_monitoring(core: &SharedCore) {
     // 创建轮询线程通道
     let (poll_tx, poll_rx) = mpsc::channel::<PollMsg>();
     let (ctrl_tx, ctrl_rx) = mpsc::channel::<CtrlCmd>();
+
+    // 让蓝牙监控器直接把适配器开/关等事件送入与轮询结果相同的通道，
+    // 否则 AdapterPoweredOff/On 事件永远发不出来（此前 set_event_sender 从未被调用）。
+    bt.set_event_sender(poll_tx.clone());
 
     // 创建 SmartPoller 并启动
     let mut poller = SmartPoller::new(c.config.rssi_threshold, c.config.scan_interval_sec);
@@ -857,6 +902,7 @@ fn refresh_device_list_ui(
     core: &SharedCore,
     page_container: &GtkBox,
     pick_container: &GtkBox,
+    mw: &Arc<Mutex<ui::MonitorWidgets>>,
 ) {
     let devices = scanner::scan_connected_devices();
     log::info!("刷新设备列表: {} 个设备", devices.len());
@@ -864,9 +910,10 @@ fn refresh_device_list_ui(
     let pc = page_container.clone();
     let pk = pick_container.clone();
     let w = win.clone();
+    let mw_owned = mw.clone();
     let on_select: Rc<RefCell<Box<dyn Fn(&scanner::DeviceInfo)>>> =
         Rc::new(RefCell::new(Box::new(move |dev| {
-            select_device_from_pick(&c, &w, &pc, &pk, dev);
+            select_device_from_pick(&c, &w, &pc, &pk, &mw_owned, dev);
         })));
     ui::update_device_list(device_list, &devices, on_select);
 }
@@ -876,6 +923,7 @@ fn select_device_from_pick(
     win: &ApplicationWindow,
     page_container: &GtkBox,
     pick_container: &GtkBox,
+    mw: &Arc<Mutex<ui::MonitorWidgets>>,
     dev: &scanner::DeviceInfo,
 ) {
     log::info!("选择设备: {} ({})", dev.name, dev.mac);
@@ -888,34 +936,18 @@ fn select_device_from_pick(
     pick_container.set_visible(false);
     page_container.set_visible(true);
     win.set_title(Some(&format!("{} - {}", tr("title"), &dev.name)));
-    // 更新监控页设备信息
-    if let Some(child) = page_container.first_child() {
-        if let Ok(monitor_box) = child.downcast::<GtkBox>() {
-            update_monitor_device_info(&monitor_box, &dev.name, &dev.mac);
-        }
+    // 直接通过 mw 引用刷新设备名/MAC 标签。
+    // 不能用 update_monitor_device_info 的"文本为 -- 才更新"逻辑：
+    // 更换设备时旧标签已是真实数据，会被该判断跳过，导致界面仍显示旧设备。
+    {
+        let cfg = core.lock().unwrap().config.clone();
+        let mw_ui = mw.lock().unwrap();
+        mw_ui.device_name.set_text(&dev.name);
+        mw_ui.device_mac.set_text(&dev.mac);
+        // 将已保存的配置同步到 UI 开关/滑块，避免切换设备后开关回退为默认值
+        ui::sync_settings_from_config(&mw_ui, &cfg);
     }
     start_monitoring(core);
-}
-
-/// 更新监控页设备信息标签（递归搜索嵌套的 GtkBox）
-fn update_monitor_device_info(box_widget: &GtkBox, name: &str, mac: &str) {
-    let mut child = box_widget.first_child();
-    while let Some(c) = child {
-        let next = c.next_sibling();
-        if let Ok(label) = c.clone().downcast::<gtk::Label>() {
-            let text = label.text().to_string();
-            if text == "--" || text.is_empty() {
-                if label.has_css_class("card-value") {
-                    label.set_text(name);
-                } else if label.has_css_class("card-mac") {
-                    label.set_text(mac);
-                }
-            }
-        } else if let Ok(inner_box) = c.clone().downcast::<GtkBox>() {
-            update_monitor_device_info(&inner_box, name, mac);
-        }
-        child = next;
-    }
 }
 
 // ── 蓝牙事件处理 ──────────────────────────────────────────────────────────
@@ -965,14 +997,23 @@ fn handle_bt_event(core: &SharedCore, event: BtEvent, mw: &Arc<Mutex<ui::Monitor
             c.set_conn("disconnected", -100);
             // 启动锁屏倒计时（倒计时中每秒检测用户活动，活跃则取消）
             c.start_countdown();
-            // 同时尝试自动重连
-            if c.config.auto_connect_device && !c.auto_connecting {
+            // 先在锁内记录开关与状态，避免后续释放锁后重入死锁
+            let auto_cfg = c.config.auto_connect_device;
+            let already_auto = c.auto_connecting;
+            if auto_cfg && !already_auto {
                 c.start_auto_connect();
-            } else if !c.config.auto_connect_device {
-                judge_after_unreachable(&mut c, core);
             }
-            // 确保UI更新
+            // 确保UI更新（此时仍持有锁）
             update_ui(&c, &mw);
+            // 释放锁后再触发后续动作，避免对非重入 Mutex 重入死锁
+            drop(c);
+            if auto_cfg && !already_auto {
+                // 真正发起蓝牙重连（之前只置了标志却从不执行，这里补齐）
+                start_connect_attempt(core);
+            } else if !auto_cfg {
+                // 未开启自动重连：处理「用户活跃期间跳过锁屏」逻辑
+                judge_after_unreachable(core);
+            }
         }
         BtEvent::RssiChanged(rssi) => {
             if c.paused || !c.current_connected {
@@ -1026,6 +1067,7 @@ fn handle_bt_event(core: &SharedCore, event: BtEvent, mw: &Arc<Mutex<ui::Monitor
         }
         BtEvent::AdapterPoweredOn => {
             log::info!("蓝牙适配器已开启");
+            let mut need_connect = false;
             if c.app_state == AppState::BleTurnedOff {
                 c.set_state(AppState::Monitoring);
                 if c.current_connected {
@@ -1033,13 +1075,21 @@ fn handle_bt_event(core: &SharedCore, event: BtEvent, mw: &Arc<Mutex<ui::Monitor
                     c.set_conn("connected", rssi);
                 } else if c.config.auto_connect_device && !c.config.phone_mac.is_empty() {
                     c.set_conn("reconnecting", -100);
-                    c.start_auto_connect();
+                    if !c.auto_connecting {
+                        c.start_auto_connect();
+                        need_connect = true;
+                    }
                 } else {
                     c.set_conn("disconnected", -100);
                 }
             }
-            // 确保UI更新
+            // 确保UI更新（此时仍持有锁）
             update_ui(&c, &mw);
+            // 释放锁后再发起重连，避免重入死锁
+            drop(c);
+            if need_connect {
+                start_connect_attempt(core);
+            }
         }
     }
 }
@@ -1048,27 +1098,36 @@ fn handle_bt_event(core: &SharedCore, event: BtEvent, mw: &Arc<Mutex<ui::Monitor
 
 fn countdown_tick(core: &SharedCore, _mw: &Arc<Mutex<ui::MonitorWidgets>>) {
     let mut c = core.lock().unwrap();
-    if c.app_state != AppState::Countdown || c.countdown_remaining <= 0 {
-        return;
-    }
-    let idle_ms = locker::get_idle_ms();
-    log::debug!(
-        "[倒计时] remaining={}s, idle={:?}ms",
-        c.countdown_remaining, idle_ms
-    );
-    // Some(0) 表示用户刚刚有过操作（鼠标/键盘），取消锁屏
-    // None 表示无法检测（视为用户未活动，允许锁屏）
-    if idle_ms == Some(0) {
-        log::info!("检测到用户活动（idle=0ms），取消锁屏倒计时");
-        c.cancel_countdown();
-        c.lock_abandoned = true;
-        return;
-    }
-    c.countdown_remaining -= 1;
-    if c.countdown_remaining <= 0 {
-        c.countdown_expired = true;
-        drop(c);
-        do_lock_screen(core);
+    if c.app_state == AppState::Countdown && c.countdown_remaining > 0 {
+        let idle_ms = locker::get_idle_ms();
+        log::debug!(
+            "[倒计时] remaining={}s, idle={:?}ms",
+            c.countdown_remaining, idle_ms
+        );
+        // Some(0) 表示用户刚刚有过操作（鼠标/键盘），取消锁屏
+        // None 表示无法检测（视为用户未活动，允许锁屏）
+        if idle_ms == Some(0) {
+            log::info!("检测到用户活动（idle=0ms），取消锁屏倒计时");
+            c.cancel_countdown();
+            c.lock_abandoned = true;
+            return;
+        }
+        c.countdown_remaining -= 1;
+        if c.countdown_remaining <= 0 {
+            c.countdown_expired = true;
+            drop(c);
+            do_lock_screen(core);
+            return;
+        }
+    } else if c.lock_abandoned && c.app_state == AppState::Monitoring {
+        // 此前因用户活跃而跳过了锁屏：一旦用户恢复空闲，立即重新启动倒计时，
+        // 否则在关闭自动重连时锁屏会永久失效。
+        let idle_ms = locker::get_idle_ms();
+        if idle_ms != Some(0) {
+            log::info!("用户已停止活动，重新启动锁屏倒计时");
+            c.lock_abandoned = false;
+            c.start_countdown();
+        }
     }
 }
 
@@ -1174,12 +1233,14 @@ fn after_connect_failed(core: &SharedCore) {
         return;
     }
     log::info!("连续 {MAX_CONNECT_ATTEMPTS} 次连接失败，判定手机不在周围");
-    let mut c = core.lock().unwrap();
-    judge_after_unreachable(&mut c, core);
+    judge_after_unreachable(core);
 }
 
-fn judge_after_unreachable(c: &mut AppCore, core: &SharedCore) {
+fn judge_after_unreachable(core: &SharedCore) {
+    // 注意：本函数自行加锁，调用方必须先释放 AppCore 锁，避免对非重入 Mutex 重入导致死锁。
+    let mut c = core.lock().unwrap();
     if c.app_state == AppState::AutoPaused {
+        drop(c);
         schedule_retry_round(core);
         return;
     }
@@ -1191,17 +1252,20 @@ fn judge_after_unreachable(c: &mut AppCore, core: &SharedCore) {
             c.lock_abandoned = false;
             c.start_countdown();
         } else {
+            drop(c);
             schedule_retry_round(core);
+            return;
         }
-        return;
-    }
-    let idle_ms = locker::get_idle_ms();
-    if idle_ms != Some(0) {
-        c.start_countdown();
     } else {
-        c.lock_abandoned = true;
-        log::info!("电脑处于活跃状态，本轮不再锁屏，只持续尝试重连");
+        let idle_ms = locker::get_idle_ms();
+        if idle_ms != Some(0) {
+            c.start_countdown();
+        } else {
+            c.lock_abandoned = true;
+            log::info!("电脑处于活跃状态，本轮不再锁屏，只持续尝试重连");
+        }
     }
+    drop(c);
     schedule_retry_round(core);
 }
 
@@ -1370,9 +1434,17 @@ fn bt_poll_loop(
         let (next_ms, trigger_disconnect) = poller.tick(connected, rssi, rssi_supported);
         let fast = poller.is_fast_polling();
 
+        // 蓝牙去抖动进行中时，强制加速轮询（0.5s）以加快确认速度
+        let sleep_ms = if bt.is_state_changing() {
+            log::debug!("[轮询] 去抖动进行中，强制加速 500ms");
+            500
+        } else {
+            next_ms
+        };
+
         log::debug!(
-            "[轮询] connected={}, rssi={}dBm, supported={}, fast={}, next_ms={}",
-            connected, rssi, rssi_supported, fast, next_ms
+            "[轮询] connected={}, rssi={}dBm, supported={}, fast={}, sleep_ms={}",
+            connected, rssi, rssi_supported, fast, sleep_ms
         );
 
         // 发送状态更新到主线程
@@ -1403,8 +1475,7 @@ fn bt_poll_loop(
             let _ = poll_tx.send(PollMsg::Event(BtEvent::RssiChanged(rssi)));
         }
 
-        // 根据 SmartPoller 返回的间隔 sleep
-        let sleep_ms = next_ms.max(100) as u64; // 最小 100ms
-        thread::sleep(Duration::from_millis(sleep_ms));
+        // 根据轮询间隔 sleep
+        thread::sleep(Duration::from_millis(sleep_ms.max(100) as u64));
     }
 }
